@@ -376,7 +376,7 @@ def nuna_ogg() -> Response:
         return jsonify(
             ble.nuna_make_ogg(
                 session_id,
-                channels=int(body.get("channels", 1)),
+                channels=int(body.get("channels", 2)),
                 input_sample_rate=int(body.get("input_sample_rate", 16000)),
                 samples_per_frame=int(body.get("samples_per_frame", 960)),
             )
@@ -391,6 +391,45 @@ def nuna_ogg() -> Response:
 app.add_url_rule(
     "/api/nuna/wav", view_func=nuna_ogg, methods=["POST"], endpoint="nuna_wav_compat"
 )
+
+
+@app.get("/api/nuna/recorded")
+def nuna_recorded() -> Response:
+    """List previously-recorded Nuna sessions that have a playable
+    audio.ogg on disk. Survives server restarts."""
+    return jsonify({"sessions": ble.nuna_list_recorded()})
+
+
+@app.get("/api/nuna/audio")
+def nuna_audio() -> Response:
+    """Stream a session's `audio.ogg` directly so the browser <audio>
+    element can play it without round-tripping through /api/record/file.
+    Set ?download=1 for an attachment download instead of inline playback."""
+    session_id = request.args.get("id")
+    if not session_id:
+        return _err("id query param required")
+    try:
+        ogg_path = ble.nuna_audio_path(session_id)
+    except KeyError as exc:
+        return _err(str(exc), 404)
+    if not ogg_path.exists():
+        return _err(
+            "audio.ogg not yet generated for this session — click Stop, "
+            "or POST /api/nuna/ogg to mux it now",
+            404,
+        )
+    if not _under(ogg_path, RECORDINGS_ROOT):
+        return _err("audio path outside recordings dir", 400)
+
+    as_attachment = request.args.get("download") in ("1", "true", "yes")
+    download_name = f"{session_id}.ogg"
+    return send_file(
+        ogg_path,
+        mimetype="audio/ogg",
+        as_attachment=as_attachment,
+        download_name=download_name,
+        conditional=True,  # supports HTTP Range so seeking works
+    )
 
 
 @app.get("/api/stream")

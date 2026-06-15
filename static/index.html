@@ -92,15 +92,35 @@
           <input id="nuna-duuid" placeholder="e.g. 12345678-1234-3abc-8000-..." style="margin-left:6px; min-width:240px">
         </label>
       </div>
+      <div id="nuna-player" style="display:none; margin-top:12px; padding:10px; background:var(--panel-2); border:1px solid var(--border); border-radius:8px;">
+        <div class="row" style="margin-bottom:8px; gap:12px">
+          <strong style="color:var(--good)">Recorded audio ready</strong>
+          <span id="nuna-player-meta" style="color:var(--muted); font-family:ui-monospace,Menlo,monospace; font-size:12px;"></span>
+        </div>
+        <audio id="nuna-audio" controls preload="metadata" style="width:100%; max-width:520px; display:block;"></audio>
+        <div class="row" style="margin-top:8px">
+          <a id="nuna-download" class="secondary" href="#" download style="background:var(--panel); color:var(--text); border:1px solid var(--border); padding:6px 12px; border-radius:6px; text-decoration:none; font-size:13px;">Download .ogg</a>
+          <button id="btn-nuna-remix" class="secondary" title="rebuild the OGG from the captured raw Opus packets with different params">Re-mux</button>
+        </div>
+      </div>
+
+      <details style="margin-top:10px">
+        <summary style="cursor:pointer; color:var(--muted); font-size:12px">Previously recorded sessions on disk</summary>
+        <div id="nuna-recorded-list" style="margin-top:8px; font-size:12px;"></div>
+      </details>
+
       <pre id="nuna-status" style="margin-top:12px">(idle)</pre>
       <div id="nuna-events" style="max-height:160px; overflow:auto; border:1px solid var(--border); border-radius:6px; margin-top:8px; padding:6px; font-family:ui-monospace,Menlo,monospace; font-size:11px;"></div>
       <div id="nuna-files"></div>
-      <div class="row" style="margin-top:10px; align-items:flex-end; flex-wrap:wrap">
-        <div><label>channels</label><input id="nuna-ch" type="number" value="1" min="1" max="2" style="min-width:80px"></div>
-        <div><label>input sample rate</label><input id="nuna-isr" type="number" value="16000" style="min-width:120px"></div>
-        <div><label>samples / frame</label><input id="nuna-spf" type="number" value="960" style="min-width:120px"></div>
-        <button id="btn-nuna-ogg" class="secondary">Make .ogg</button>
-      </div>
+      <details style="margin-top:10px; color:var(--muted)">
+        <summary style="cursor:pointer; font-size:12px">Advanced: re-mux parameters (only needed if the audio sounds wrong)</summary>
+        <div class="row" style="margin-top:8px; align-items:flex-end; flex-wrap:wrap">
+          <div><label>channels</label><input id="nuna-ch" type="number" value="2" min="1" max="2" style="min-width:80px"></div>
+          <div><label>input sample rate</label><input id="nuna-isr" type="number" value="16000" style="min-width:120px"></div>
+          <div><label>samples / frame</label><input id="nuna-spf" type="number" value="960" style="min-width:120px"></div>
+          <button id="btn-nuna-ogg" class="secondary">Make .ogg</button>
+        </div>
+      </details>
     </section>
 
     <section class="card">
@@ -454,18 +474,73 @@
     refreshStatus();
     setInterval(refreshStatus, 5000);
 
-    let nunaTimer = null, nunaActiveId = null;
+    async function refreshRecordedList() {
+      try {
+        const r = await api("/api/nuna/recorded");
+        const list = (r.sessions || []);
+        const box = $("nuna-recorded-list");
+        if (!list.length) { box.innerHTML = "<div style='color:var(--muted)'>(none yet)</div>"; return; }
+        box.innerHTML = list.map(s => {
+          const sizeKB = (s.audio_ogg_bytes / 1024).toFixed(1);
+          return `<div class="row" style="margin-top:4px"><code>${s.id}</code> · ${sizeKB} KB · <a href="#" data-play-id="${s.id}">play</a> · <a href="${s.download_url}" download>download</a></div>`;
+        }).join("");
+        box.querySelectorAll("a[data-play-id]").forEach(a => a.onclick = (e) => {
+          e.preventDefault();
+          showNunaPlayer(a.dataset.playId, `from disk · ${a.parentElement.textContent.split('·')[1].trim()}`);
+        });
+      } catch (e) { /* silently ignore */ }
+    }
+    refreshRecordedList();
+
+    let nunaTimer = null, nunaActiveId = null, nunaAudioId = null;
     function fmtBytes(n) {
       if (n < 1024) return `${n} B`;
       if (n < 1024*1024) return `${(n/1024).toFixed(1)} KB`;
       return `${(n/1024/1024).toFixed(2)} MB`;
     }
+    function showNunaPlayer(sessionId, meta) {
+      // Cache-bust so the <audio> element refetches after a re-mux of the
+      // same session id.
+      const url = `/api/nuna/audio?id=${encodeURIComponent(sessionId)}&t=${Date.now()}`;
+      const audio = $("nuna-audio");
+      if (nunaAudioId !== sessionId || audio.src.indexOf(`id=${encodeURIComponent(sessionId)}`) < 0) {
+        audio.src = url;
+        audio.load();
+      } else {
+        // Force a refresh on every update to pick up re-muxes
+        audio.src = url;
+        audio.load();
+      }
+      nunaAudioId = sessionId;
+      $("nuna-download").href = `/api/nuna/audio?id=${encodeURIComponent(sessionId)}&download=1`;
+      $("nuna-download").setAttribute("download", `${sessionId}.ogg`);
+      $("nuna-player-meta").textContent = meta || "";
+      $("nuna-player").style.display = "block";
+    }
+    function hideNunaPlayer() {
+      $("nuna-player").style.display = "none";
+      const a = $("nuna-audio");
+      a.removeAttribute("src");
+      a.load();
+      nunaAudioId = null;
+    }
+    function describeSession(s) {
+      const dur = (s.last_audio_at && s.first_audio_at) ? (s.last_audio_at - s.first_audio_at) : 0;
+      return `${fmtBytes(s.audio_bytes||0)} · ${s.audio_packets||0} frames · ${dur.toFixed(2)}s`;
+    }
     function renderNuna(s) {
       const a = s && s.active;
+      // Pick a session to play: prefer active one, else most-recent finished
+      const sessions = (s && s.sessions) || [];
+      const finished = sessions.filter(x => x.audio_ogg_ready).sort((x, y) => (y.started_at||0) - (x.started_at||0));
+      const playable = (a && a.audio_ogg_ready) ? a : finished[0];
+
       if (!a) {
         $("nuna-status").textContent = JSON.stringify(s, null, 2);
         $("nuna-files").innerHTML = "";
         $("nuna-rate").textContent = "";
+        if (playable) showNunaPlayer(playable.id, describeSession(playable));
+        else hideNunaPlayer();
         return;
       }
       nunaActiveId = a.id;
@@ -476,11 +551,11 @@
       $("nuna-status").textContent = JSON.stringify(a, null, 2);
       const links = [
         `<div class="row" style="margin-top:6px"><code>${a.id}</code> · ${a.dir}</div>`,
-        `<div class="row" style="margin-top:6px"><a href="/api/record/file?path=${encodeURIComponent(a.opus_packets)}">download audio.opus_packets.bin</a> · <a href="/api/record/file?path=${encodeURIComponent(a.raw)}">download raw_notify.bin</a></div>`,
+        `<div class="row" style="margin-top:6px"><a href="/api/record/file?path=${encodeURIComponent(a.opus_packets)}">audio.opus_packets.bin</a> · <a href="/api/record/file?path=${encodeURIComponent(a.raw)}">raw_notify.bin</a></div>`,
       ];
-      const oggGuess = a.dir + "/audio.ogg";
-      links.push(`<div class="row" style="margin-top:6px"><a href="/api/record/file?path=${encodeURIComponent(oggGuess)}">download audio.ogg (after Make .ogg)</a></div>`);
       $("nuna-files").innerHTML = links.join("");
+      if (playable) showNunaPlayer(playable.id, describeSession(playable));
+      else hideNunaPlayer();
     }
     async function refreshNuna() {
       try {
@@ -514,11 +589,20 @@
         clearInterval(nunaTimer); nunaTimer = null;
         $("nuna-status").textContent = JSON.stringify(m, null, 2);
         if (m && m.id) nunaActiveId = m.id;
+        // The server auto-builds .ogg if any frames were captured. Show the
+        // player immediately so the user can preview without extra clicks.
+        if (m && m.audio_ogg && m.id) {
+          showNunaPlayer(m.id, describeSession(m));
+        } else if (m && m.id) {
+          // Fall back: maybe the file already existed from a previous run
+          await refreshNuna();
+        }
         await refreshStatus();
       } catch (e) { $("nuna-status").textContent = (force ? "force stop failed: " : "stop failed: ") + e.message; }
     }
     $("btn-nuna-stop").onclick = () => nunaStopRequest(false);
     $("btn-nuna-force-stop").onclick = () => nunaStopRequest(true);
+    $("btn-nuna-remix").onclick = () => $("btn-nuna-ogg").click();
     $("btn-nuna-mmwave").onclick = async () => {
       try {
         const r = await api("/api/nuna/try-mmwave", { method: "POST", body: JSON.stringify({}) });
@@ -526,17 +610,21 @@
       } catch (e) { $("nuna-status").textContent = "mmwave probe failed: " + e.message; }
     };
     $("btn-nuna-ogg").onclick = async () => {
-      if (!nunaActiveId) return alert("no nuna session yet — start one first");
+      // Prefer the most recently played session id — falls back to the
+      // active one. This lets Re-mux work after Stop, when the active
+      // session is gone but the user still wants to retune params.
+      const targetId = nunaAudioId || nunaActiveId;
+      if (!targetId) return alert("no nuna session yet — start one first");
       const body = {
-        id: nunaActiveId,
+        id: targetId,
         channels: parseInt($("nuna-ch").value, 10),
         input_sample_rate: parseInt($("nuna-isr").value, 10),
         samples_per_frame: parseInt($("nuna-spf").value, 10),
       };
       try {
         const r = await api("/api/nuna/ogg", { method: "POST", body: JSON.stringify(body) });
-        $("nuna-status").textContent = "OGG written: " + JSON.stringify(r, null, 2)
-          + "\n\nDecode with: ffmpeg -i \"" + r.path + "\" audio.wav"
+        showNunaPlayer(targetId, `${r.packets} frames · ~${r.approx_duration_s.toFixed(2)}s · ${fmtBytes(r.bytes_written)}`);
+        $("nuna-status").textContent = "OGG (re)muxed:\n" + JSON.stringify(r, null, 2)
           + "\n\n" + ($("nuna-status").textContent || "");
       } catch (e) { $("nuna-status").textContent = "ogg failed: " + e.message; }
     };
@@ -555,7 +643,7 @@
                                           .map(([k,v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`).join(" ");
           div.textContent = `[${ts}] ${d.name}  ${detail}`;
           if (d.name && d.name.endsWith("_err")) div.style.color = "var(--bad)";
-          if (d.name === "handshake_completed_sent" || d.name === "audio_enable_sent") div.style.color = "var(--good)";
+          if (d.name === "handshake_completed_sent" || d.name === "switch_record_on_sent" || d.name === "audio_enable_sent") div.style.color = "var(--good)";
           if (d.name === "handshake_response" && d.match === false) div.style.color = "var(--bad)";
           if (d.name === "handshake_aborted" || d.name === "handshake_mismatch" || d.name === "handshake_timeout") div.style.color = "var(--bad)";
           const box = $("nuna-events");

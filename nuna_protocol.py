@@ -35,14 +35,23 @@ same value we expect back.
 
 Audio frame body (`MessageBodyParserUtil.decodeAudioFrame`, comes inside
 AUDIO_RECORDING_DATA messages on RECORDING_CHAR):
-  [0..2]  frameId      uint16 LE
-  [2..4]  frameSize    uint16 LE   (assembled total payload size)
-  [4]     chunkId      uint8       (0..totalChunks-1, sequence inside frame)
-  [5]     totalChunks  uint8
+  [0..2]  frameId      uint16 LE   (logical "frame group" id; spans many Opus packets)
+  [2..4]  frameSize    uint16 LE   (size of EACH individual Opus packet in bytes)
+  [4]     chunkId      uint8       (0..totalChunks-1, BLE chunk index)
+  [5]     totalChunks  uint8       (BLE chunks per frame group)
   [6..14] timestamp    uint64 LE   (ms epoch from device clock)
-  [14..]  opus_chunk
-The reassembled `payload` for one frameId (concatenated chunks in chunkId
-order) is a single Opus packet (per `AudioFrameHandler.saveOpusDataToFile`).
+  [14..]  body         (payload for this BLE chunk)
+
+The body of each BLE chunk is a sequence of `frameSize` back-to-back Opus
+packets — NOT a fragment of one giant packet. Empirically every chunk we've
+captured from real Nuna firmware is 480 bytes and `frameSize == 80`, so each
+chunk carries 6 self-contained Opus packets of 80 B (CELT-WB 20 ms CBR @
+32 kbps, TOC 0xbc). `AudioFrameHandler.saveOpusDataToFile` in the Android
+app concatenates the chunk bodies and dumps them into a `*_continuous.opus`
+file, which only happens to work because the file is then fed to the system
+opus decoder *which auto-resyncs on TOC bytes* — that file is NOT a valid
+single Opus packet. Use `extract_opus_packets()` below to slice the chunk
+bodies into proper individual Opus packets that can be muxed into Ogg.
 """
 from __future__ import annotations
 
@@ -345,41 +354,66 @@ class Parser:
         return out
 
 
-# --- Frame reassembler --------------------------------------------------
+# --- Per-chunk Opus packet extractor ------------------------------------
+
+def extract_opus_packets(frame: AudioFrame) -> list[bytes]:
+    """Split one AUDIO_RECORDING_DATA chunk into its component Opus packets.
+
+    The Nuna firmware emits CBR-encoded Opus where every packet is exactly
+    `frame.frame_size` bytes long, packed back-to-back inside the BLE chunk
+    body. We confirmed this by walking the captured BLE traffic: every
+    chunk's body of 480 B starts with `0xbc` (CELT-WB 20 ms TOC) at offsets
+    0, 80, 160, 240, 320, 400 — exactly 6 × 80-byte Opus packets per chunk.
+
+    If `frame_size` is missing (zero) or doesn't divide the body cleanly,
+    we fall back to treating the whole body as one packet so that
+    development sessions with unusual firmware still capture *something*.
+    """
+    body = frame.payload
+    pkt_size = frame.frame_size
+    if pkt_size <= 0 or pkt_size > len(body):
+        return [body] if body else []
+    n_full = len(body) // pkt_size
+    return [body[i * pkt_size:(i + 1) * pkt_size] for i in range(n_full)]
+
 
 class AudioReassembler:
-    """Reassembles AUDIO_RECORDING_DATA chunks into full Opus frames.
+    """Backward-compat shim. Earlier versions of this server tried to glue
+    BLE chunks into one big "Opus packet" — that's wrong (see the module
+    docstring). This class now just yields each chunk's Opus packets one at
+    a time; the consumer should treat each yielded packet as a complete,
+    decodable Opus frame.
 
-    Yields complete `(frame_id, timestamp_ms, opus_bytes)` from `add()`."""
+    The yielded shape `(frame_id, timestamp_ms, opus_bytes)` is preserved
+    from the older API for callers that haven't migrated yet, but a single
+    `add()` may now produce multiple packets — call `add_many()` instead
+    to get them all.
+    """
 
     def __init__(self, max_frames: int = 64) -> None:
-        self._buffers: dict[int, dict] = {}
+        self._pending: list[tuple[int, int, bytes]] = []
+        # max_frames retained for API compatibility; no buffering needed
         self._max = max_frames
 
-    def add(self, frame: AudioFrame):
-        if frame.total_chunks <= 0:
+    def add_many(self, frame: AudioFrame) -> list[tuple[int, int, bytes]]:
+        out: list[tuple[int, int, bytes]] = []
+        for pkt in extract_opus_packets(frame):
+            out.append((frame.frame_id, frame.timestamp_ms, pkt))
+        return out
+
+    def add(self, frame: AudioFrame):  # legacy single-yield API
+        out = self.add_many(frame)
+        if not out:
             return None
-        slot = self._buffers.setdefault(
-            frame.frame_id,
-            {
-                "size": frame.frame_size,
-                "total": frame.total_chunks,
-                "ts": frame.timestamp_ms,
-                "chunks": {},
-            },
-        )
-        slot["chunks"][frame.chunk_id] = frame.payload
-        if len(slot["chunks"]) >= slot["total"]:
-            ordered = b"".join(
-                slot["chunks"][i] for i in sorted(slot["chunks"].keys())
-            )
-            del self._buffers[frame.frame_id]
-            return frame.frame_id, slot["ts"], ordered
-        # bound memory for stragglers
-        if len(self._buffers) > self._max:
-            oldest = min(self._buffers.keys())
-            del self._buffers[oldest]
-        return None
+        # Stash any extras so a caller polling add() in a loop still sees them.
+        first, *rest = out
+        self._pending.extend(rest)
+        return first
+
+    def drain(self) -> list[tuple[int, int, bytes]]:
+        out = list(self._pending)
+        self._pending.clear()
+        return out
 
 
 # --- Self test ----------------------------------------------------------

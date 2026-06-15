@@ -31,8 +31,8 @@ from nuna_protocol import (
     HandshakeMessageType,
     MessageType as NunaMsgType,
     NOTIFY_CHARS as NUNA_NOTIFY_CHARS,
-    AudioReassembler,
     Parser as NunaParser,
+    extract_opus_packets,
     handshake_completed_packet,
     handshake_request_packet,
     heartbeat as nuna_heartbeat,
@@ -161,11 +161,13 @@ class _NunaSession:
 
         # per-channel parsers (each notify char carries its own framed stream)
         self.parsers: dict[str, NunaParser] = {}
-        self.assembler = AudioReassembler()
 
-        self.audio_packets = 0          # # Opus frames assembled
-        self.audio_bytes = 0             # bytes in assembled Opus payloads
-        self.audio_chunks = 0            # # AUDIO_RECORDING_DATA notifications received
+        # `audio_packets` is the count of individual Opus packets we've
+        # extracted from chunk bodies (each ~20 ms); `audio_chunks` counts
+        # the underlying AUDIO_RECORDING_DATA BLE notifications.
+        self.audio_packets = 0
+        self.audio_bytes = 0
+        self.audio_chunks = 0
         self.frame_size_hist: dict[int, int] = {}
         self.message_counts: dict[str, int] = {}
         self.notify_counts: dict[str, int] = {}
@@ -291,27 +293,34 @@ class _NunaSession:
                 "error": str(exc), "len": len(body), "ts": time.time(),
             })
             return
-        result = self.assembler.add(frame)
-        if result is None:
+
+        # Each BLE chunk body is N back-to-back fixed-size Opus packets
+        # (CBR Opus). See `nuna_protocol.extract_opus_packets`.
+        packets = extract_opus_packets(frame)
+        if not packets:
             return
-        frame_id, ts_ms, opus = result
-        self.audio_packets += 1
-        self.audio_bytes += len(opus)
-        self.frame_size_hist[len(opus)] = self.frame_size_hist.get(len(opus), 0) + 1
+
         now = time.time()
         if self.first_audio_at is None:
             self.first_audio_at = now
         self.last_audio_at = now
-        try:
-            self.opus_file.write(struct.pack("<I", len(opus)))
-            self.opus_file.write(opus)
-            self.opus_file.write(struct.pack("<Q", ts_ms))
-        except Exception:
-            pass
+
+        for opus in packets:
+            self.audio_packets += 1
+            self.audio_bytes += len(opus)
+            self.frame_size_hist[len(opus)] = self.frame_size_hist.get(len(opus), 0) + 1
+            try:
+                self.opus_file.write(struct.pack("<I", len(opus)))
+                self.opus_file.write(opus)
+                self.opus_file.write(struct.pack("<Q", frame.timestamp_ms))
+            except Exception:
+                pass
+
         publish({
             "type": "nuna_audio", "session": self.id, "ts": now,
-            "frame_id": frame_id, "frame_bytes": len(opus),
-            "device_ts_ms": ts_ms,
+            "frame_id": frame.frame_id, "frame_bytes": packets[0] and len(packets[0]),
+            "packets_in_chunk": len(packets),
+            "device_ts_ms": frame.timestamp_ms,
             "total_packets": self.audio_packets,
             "total_bytes": self.audio_bytes,
         })
@@ -341,11 +350,15 @@ class _NunaSession:
             else 0.0
         )
         avg_rate = self.audio_bytes / elapsed_audio if elapsed_audio > 0 else 0.0
+        ogg_path = self.dir / "audio.ogg"
+        ogg_ready = ogg_path.exists() and ogg_path.stat().st_size > 0
         return {
             "id": self.id,
             "dir": str(self.dir.resolve()),
             "raw": str(self.raw_path.resolve()),
             "opus_packets": str(self.opus_packets_path.resolve()),
+            "audio_ogg_path": str(ogg_path.resolve()),
+            "audio_ogg_ready": ogg_ready,
             "stopped": self.stopped,
             "started_at": self.started_at,
             "first_audio_at": self.first_audio_at,
@@ -602,7 +615,7 @@ class BleManager:
     def nuna_make_ogg(
         self,
         session_id: str,
-        channels: int = 1,
+        channels: int = 2,
         input_sample_rate: int = 16000,
         samples_per_frame: int = 960,
     ) -> dict[str, Any]:
@@ -611,28 +624,101 @@ class BleManager:
         official app appends them to a `*_continuous.opus` file but never
         wraps them, so they're not directly playable. We add a minimal
         OpusHead + OpusTags + framed pages so the result plays in VLC,
-        ffmpeg, etc."""
+        ffmpeg, browsers, etc."""
         session = self._nuna_sessions.get(session_id)
         if session is None:
             raise KeyError(f"no nuna session '{session_id}'")
-
-        packets: list[bytes] = []
-        with session.opus_packets_path.open("rb") as f:
-            while True:
-                lenb = f.read(4)
-                if len(lenb) < 4:
-                    break
-                (plen,) = struct.unpack("<I", lenb)
-                pkt = f.read(plen)
-                if len(pkt) < plen:
-                    break
-                f.read(8)  # discard per-packet timestamp
-                if pkt:
-                    packets.append(pkt)
-        if not packets:
+        result = self._finalize_ogg(
+            session,
+            channels=channels,
+            input_sample_rate=input_sample_rate,
+            samples_per_frame=samples_per_frame,
+        )
+        if result is None:
             raise RuntimeError(
                 f"no opus packets captured in session '{session_id}'"
             )
+        return result
+
+    nuna_make_wav = nuna_make_ogg  # backward-compat alias for older clients
+
+    def nuna_audio_path(self, session_id: str) -> Path:
+        """Resolve the absolute path of a session's `audio.ogg`.
+
+        Looks up the in-memory session first (for live playback right after
+        Stop), then falls back to `<recordings_root>/<session_id>/audio.ogg`
+        so previously-captured sessions stay playable after a server
+        restart. Rejects ids that contain path separators to keep us inside
+        the recordings root."""
+        if "/" in session_id or ".." in session_id or "\\" in session_id:
+            raise KeyError(f"invalid session id: {session_id!r}")
+        session = self._nuna_sessions.get(session_id)
+        if session is not None:
+            return (session.dir / "audio.ogg").resolve()
+        candidate = (self.recordings_root / session_id / "audio.ogg").resolve()
+        try:
+            candidate.relative_to(self.recordings_root.resolve())
+        except ValueError:
+            raise KeyError(f"session id outside recordings root: {session_id!r}")
+        return candidate
+
+    def nuna_list_recorded(self) -> list[dict[str, Any]]:
+        """List session directories on disk that have an `audio.ogg` file.
+        Useful for repopulating the UI after a server restart."""
+        out: list[dict[str, Any]] = []
+        try:
+            children = sorted(self.recordings_root.iterdir(), reverse=True)
+        except FileNotFoundError:
+            return out
+        for child in children:
+            if not child.is_dir() or not child.name.startswith("nuna-"):
+                continue
+            ogg = child / "audio.ogg"
+            if not ogg.exists():
+                continue
+            try:
+                size = ogg.stat().st_size
+            except OSError:
+                continue
+            out.append({
+                "id": child.name,
+                "dir": str(child.resolve()),
+                "audio_ogg_path": str(ogg.resolve()),
+                "audio_ogg_bytes": size,
+                "audio_url": f"/api/nuna/audio?id={child.name}",
+                "download_url": f"/api/nuna/audio?id={child.name}&download=1",
+            })
+        return out
+
+    def _finalize_ogg(
+        self,
+        session: "_NunaSession",
+        *,
+        channels: int = 2,
+        input_sample_rate: int = 16000,
+        samples_per_frame: int = 960,
+    ) -> Optional[dict[str, Any]]:
+        """Build `<session.dir>/audio.ogg` from the captured opus packet
+        log. Returns the manifest, or None if no packets were captured (so
+        callers like `_nuna_stop` can no-op silently on aborted sessions)."""
+        packets: list[bytes] = []
+        try:
+            with session.opus_packets_path.open("rb") as f:
+                while True:
+                    lenb = f.read(4)
+                    if len(lenb) < 4:
+                        break
+                    (plen,) = struct.unpack("<I", lenb)
+                    pkt = f.read(plen)
+                    if len(pkt) < plen:
+                        break
+                    f.read(8)  # discard per-packet timestamp
+                    if pkt:
+                        packets.append(pkt)
+        except FileNotFoundError:
+            return None
+        if not packets:
+            return None
 
         ogg_path = session.dir / "audio.ogg"
         ogg_bytes = _build_ogg_opus(
@@ -652,8 +738,6 @@ class BleManager:
             "approx_duration_s": duration_s,
             "bytes_written": len(ogg_bytes),
         }
-
-    nuna_make_wav = nuna_make_ogg  # backward-compat alias for older clients
 
     def _watch_idle_sessions(self) -> None:
         while True:
@@ -1004,6 +1088,15 @@ class BleManager:
         manifest = active.close()
         if errors:
             manifest["stop_errors"] = errors
+
+        # Auto-mux captured opus packets into a playable .ogg so the user
+        # can preview / download immediately without a second click.
+        try:
+            ogg = self._finalize_ogg(active)
+            if ogg is not None:
+                manifest["audio_ogg"] = ogg
+        except Exception as exc:
+            manifest["audio_ogg_error"] = str(exc)
         return manifest
 
     async def _scan(self, seconds: float) -> list[dict[str, Any]]:
