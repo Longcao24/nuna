@@ -1100,20 +1100,45 @@ class BleManager:
         return manifest
 
     async def _scan(self, seconds: float) -> list[dict[str, Any]]:
+        # Merge across detections per address. On Windows the first
+        # advertisement packet often has no name — the name only arrives in a
+        # later scan response, so overwriting the entry on every callback
+        # loses the name. Always keep the best-so-far name and union the
+        # service UUID / manufacturer data sets.
         found: dict[str, dict[str, Any]] = {}
 
         def _on_detect(device: BLEDevice, adv: AdvertisementData) -> None:
-            found[device.address] = {
-                "address": device.address,
-                "name": device.name or adv.local_name,
-                "rssi": adv.rssi,
-                "service_uuids": list(adv.service_uuids or []),
-                "manufacturer_data": {
-                    str(k): v.hex() for k, v in (adv.manufacturer_data or {}).items()
-                },
-            }
+            entry = found.get(device.address)
+            if entry is None:
+                entry = {
+                    "address": device.address,
+                    "name": None,
+                    "rssi": adv.rssi,
+                    "service_uuids": [],
+                    "manufacturer_data": {},
+                }
+                found[device.address] = entry
 
-        scanner = BleakScanner(detection_callback=_on_detect)
+            name = device.name or adv.local_name
+            if name and not entry["name"]:
+                entry["name"] = name
+            if adv.rssi is not None:
+                entry["rssi"] = adv.rssi
+            if adv.service_uuids:
+                seen = set(entry["service_uuids"])
+                for u in adv.service_uuids:
+                    if u not in seen:
+                        entry["service_uuids"].append(u)
+                        seen.add(u)
+            if adv.manufacturer_data:
+                for k, v in adv.manufacturer_data.items():
+                    entry["manufacturer_data"][str(k)] = v.hex()
+
+        # Active scanning on Windows is what triggers scan-response packets
+        # (which is where most devices put their name). Bleak's WinRT backend
+        # defaults to active mode, but be explicit so we don't regress if
+        # that default changes.
+        scanner = BleakScanner(detection_callback=_on_detect, scanning_mode="active")
         await scanner.start()
         try:
             await asyncio.sleep(seconds)
