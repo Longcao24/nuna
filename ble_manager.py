@@ -829,13 +829,29 @@ class BleManager:
                 found: dict[str, Any] = {"d": None}
                 done = asyncio.Event()
 
+                # On Windows the friendly name often isn't in the first
+                # advertisement frame, so we also accept the Nuna primary
+                # service UUID (0xA000) as a positive ID. That way the user
+                # doesn't have to wait for the scan response just to start
+                # live audio.
+                nuna_service = "0000a000-0000-1000-8000-00805f9b34fb"
+
                 def cb(d: BLEDevice, adv: AdvertisementData) -> None:
+                    if found["d"]:
+                        return
                     n = d.name or adv.local_name or ""
-                    if name_substr.lower() in n.lower() and not found["d"]:
+                    if name_substr.lower() in n.lower():
+                        found["d"] = d
+                        done.set()
+                        return
+                    svc = [(u or "").lower() for u in (adv.service_uuids or [])]
+                    if nuna_service in svc:
                         found["d"] = d
                         done.set()
 
-                scanner = BleakScanner(detection_callback=cb)
+                scanner = BleakScanner(
+                    detection_callback=cb, scanning_mode="active"
+                )
                 await scanner.start()
                 try:
                     await asyncio.wait_for(done.wait(), scan_seconds)

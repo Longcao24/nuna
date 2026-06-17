@@ -64,7 +64,7 @@
   <div class="grid">
     <section class="card" style="grid-column: 1 / -1;">
       <h2>Nuna pendant — live audio</h2>
-      <p style="margin:0 0 10px; color:var(--muted)">
+      <!-- <p style="margin:0 0 10px; color:var(--muted)">
         Implements the full reverse-engineered protocol from the Nuna 1.9.1 APK:
         connects, subscribes to A001/A002/A003, runs the 3-step handshake
         (HANDSHAKE_REQUEST → HANDSHAKE_RESPONSE → HANDSHAKE_COMPLETED), syncs
@@ -72,7 +72,7 @@
         CONTROL_REQUEST + SWITCH_RECORD (= the same path the official app
         uses). Audio frames stream as Opus packets on A003 and are
         reassembled into a playable .ogg file.
-      </p>
+      </p> -->
       <div class="row">
         <button id="btn-nuna-start">Start live audio</button>
         <button id="btn-nuna-stop" class="secondary">Stop</button>
@@ -137,6 +137,9 @@
       <div class="row">
         <label>seconds <input id="scan-seconds" type="number" value="5" min="1" max="30" style="min-width:80px"></label>
         <button id="btn-scan">Scan</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label><input type="checkbox" id="scan-only-nuna"> show only Nuna devices</label>
       </div>
       <div style="margin-top:12px">
         <table id="devices-table"><thead><tr><th>Name</th><th>Address</th><th>RSSI</th></tr></thead><tbody></tbody></table>
@@ -274,16 +277,42 @@
     }
     async function refreshStatus() { setStatus(await api("/api/status")); }
 
+    // Nuna pendants advertise this 16-bit service. On Windows the friendly
+    // name often doesn't make it into the first advertisement frame, so we
+    // identify the pendant by service UUID instead and badge it in the row
+    // so the user can find it even when name == null.
+    const NUNA_SERVICE_UUID = "0000a000-0000-1000-8000-00805f9b34fb";
+    function isNuna(d) {
+      const name = (d.name || "").toLowerCase();
+      if (name.includes("nuna")) return true;
+      const uuids = (d.service_uuids || []).map(u => (u || "").toLowerCase());
+      return uuids.includes(NUNA_SERVICE_UUID);
+    }
+    function deviceLabel(d) {
+      if (d.name) return d.name;
+      if (isNuna(d)) return `<span class="pill good" style="margin-right:6px">Nuna</span><span style="color:var(--muted)">(name not advertised)</span>`;
+      const mfg = Object.entries(d.manufacturer_data || {})[0];
+      if (mfg) return `<span style="color:var(--muted)">(unnamed)</span> <code style="color:var(--muted); font-size:11px">mfg ${mfg[0]}:${mfg[1].slice(0, 12)}${mfg[1].length > 12 ? "…" : ""}</code>`;
+      return `<span style="color:var(--muted)">(unnamed)</span>`;
+    }
+
     $("btn-scan").onclick = async () => {
       const seconds = parseFloat($("scan-seconds").value || "5");
       const tbody = $("devices-table").querySelector("tbody");
       tbody.innerHTML = `<tr><td colspan="3" style="color:var(--muted)">scanning ${seconds}s…</td></tr>`;
       try {
         const { devices } = await api(`/api/scan?seconds=${seconds}`);
-        devices.sort((a,b) => (b.rssi ?? -999) - (a.rssi ?? -999));
-        tbody.innerHTML = devices.map(d => `
-          <tr data-address="${d.address}">
-            <td>${d.name || "(unnamed)"}</td>
+        devices.sort((a, b) => {
+          // Float Nuna devices to the top, then sort by RSSI strength.
+          const an = isNuna(a) ? 1 : 0;
+          const bn = isNuna(b) ? 1 : 0;
+          if (an !== bn) return bn - an;
+          return (b.rssi ?? -999) - (a.rssi ?? -999);
+        });
+        const filtered = $("scan-only-nuna").checked ? devices.filter(isNuna) : devices;
+        tbody.innerHTML = filtered.map(d => `
+          <tr data-address="${d.address}" ${isNuna(d) ? 'style="background:rgba(74,222,128,.05)"' : ""}>
+            <td>${deviceLabel(d)}</td>
             <td><code>${d.address}</code></td>
             <td>${d.rssi ?? ""}</td>
           </tr>`).join("") || `<tr><td colspan="3" style="color:var(--muted)">no devices found</td></tr>`;
