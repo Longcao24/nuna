@@ -1,0 +1,727 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BLE API Server</title>
+  <style>
+    :root {
+      --bg: #0b0d12;
+      --panel: #131722;
+      --panel-2: #1a1f2e;
+      --text: #e7ecf3;
+      --muted: #8a93a6;
+      --accent: #4f8cff;
+      --good: #4ade80;
+      --bad: #f87171;
+      --border: #232a3a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 24px;
+      background: var(--bg); color: var(--text);
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    }
+    h1 { margin: 0 0 4px; font-size: 20px; }
+    p.sub { margin: 0 0 24px; color: var(--muted); }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 10px; padding: 16px;
+    }
+    .card h2 { margin: 0 0 12px; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    button {
+      background: var(--accent); color: white; border: 0; padding: 8px 14px;
+      border-radius: 6px; cursor: pointer; font-weight: 500;
+    }
+    button.secondary { background: var(--panel-2); border: 1px solid var(--border); }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    input, select {
+      background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px 10px; min-width: 220px;
+    }
+    code, pre { font: 12px/1.5 ui-monospace, "SF Mono", Menlo, monospace; }
+    pre { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 12px; max-height: 320px; overflow: auto; margin: 0; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+    .pill.good { background: rgba(74,222,128,.15); color: var(--good); }
+    .pill.bad { background: rgba(248,113,113,.15); color: var(--bad); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; }
+    tr:hover { background: rgba(255,255,255,.02); cursor: pointer; }
+    .stream-line { padding: 4px 8px; border-bottom: 1px solid var(--border); font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+    .stream-line .ts { color: var(--muted); margin-right: 8px; }
+    .stream-line .uuid { color: var(--accent); margin-right: 8px; }
+    label { color: var(--muted); font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>BLE API Server</h1>
+  <p class="sub">Flask + bleak. Scan, connect, and stream notifications from a BLE peripheral.</p>
+
+  <div class="grid">
+    <section class="card" style="grid-column: 1 / -1;">
+      <h2>Nuna pendant — live audio</h2>
+      <!-- <p style="margin:0 0 10px; color:var(--muted)">
+        Implements the full reverse-engineered protocol from the Nuna 1.9.1 APK:
+        connects, subscribes to A001/A002/A003, runs the 3-step handshake
+        (HANDSHAKE_REQUEST → HANDSHAKE_RESPONSE → HANDSHAKE_COMPLETED), syncs
+        device clock via SET_TIME, reads STATUS, then enables live audio with
+        CONTROL_REQUEST + SWITCH_RECORD (= the same path the official app
+        uses). Audio frames stream as Opus packets on A003 and are
+        reassembled into a playable .ogg file.
+      </p> -->
+      <div class="row">
+        <button id="btn-nuna-start">Start live audio</button>
+        <button id="btn-nuna-stop" class="secondary">Stop</button>
+        <button id="btn-nuna-force-stop" class="secondary" title="kill the in-memory session even if BLE is wedged">Force stop</button>
+        <button id="btn-nuna-mmwave" class="secondary" title="enable MILE_WAVE_SWITCH=1 for 2s; confirms whether the verification handshake is universal">Try mmWave</button>
+        <span id="nuna-rate" style="color:var(--muted); font-family:ui-monospace,Menlo,monospace; font-size:12px;"></span>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label><input type="checkbox" id="nuna-pair"> force pair / bond</label>
+        <label><input type="checkbox" id="nuna-force"> force reconnect</label>
+        <label>
+          verification (6 chars):
+          <input id="nuna-vc" value="123456" maxlength="6" style="margin-left:6px; width:90px">
+        </label>
+        <label style="flex:1; min-width:240px">
+          device UUID (optional, blank = stable random):
+          <input id="nuna-duuid" placeholder="e.g. 12345678-1234-3abc-8000-..." style="margin-left:6px; min-width:240px">
+        </label>
+      </div>
+      <div id="nuna-player" style="display:none; margin-top:12px; padding:10px; background:var(--panel-2); border:1px solid var(--border); border-radius:8px;">
+        <div class="row" style="margin-bottom:8px; gap:12px">
+          <strong style="color:var(--good)">Recorded audio ready</strong>
+          <span id="nuna-player-meta" style="color:var(--muted); font-family:ui-monospace,Menlo,monospace; font-size:12px;"></span>
+        </div>
+        <audio id="nuna-audio" controls preload="metadata" style="width:100%; max-width:520px; display:block;"></audio>
+        <div class="row" style="margin-top:8px">
+          <a id="nuna-download" class="secondary" href="#" download style="background:var(--panel); color:var(--text); border:1px solid var(--border); padding:6px 12px; border-radius:6px; text-decoration:none; font-size:13px;">Download .ogg</a>
+          <button id="btn-nuna-remix" class="secondary" title="rebuild the OGG from the captured raw Opus packets with different params">Re-mux</button>
+        </div>
+      </div>
+
+      <details style="margin-top:10px">
+        <summary style="cursor:pointer; color:var(--muted); font-size:12px">Previously recorded sessions on disk</summary>
+        <div id="nuna-recorded-list" style="margin-top:8px; font-size:12px;"></div>
+      </details>
+
+      <pre id="nuna-status" style="margin-top:12px">(idle)</pre>
+      <div id="nuna-events" style="max-height:160px; overflow:auto; border:1px solid var(--border); border-radius:6px; margin-top:8px; padding:6px; font-family:ui-monospace,Menlo,monospace; font-size:11px;"></div>
+      <div id="nuna-files"></div>
+      <details style="margin-top:10px; color:var(--muted)">
+        <summary style="cursor:pointer; font-size:12px">Advanced: re-mux parameters (only needed if the audio sounds wrong)</summary>
+        <div class="row" style="margin-top:8px; align-items:flex-end; flex-wrap:wrap">
+          <div><label>channels</label><input id="nuna-ch" type="number" value="2" min="1" max="2" style="min-width:80px"></div>
+          <div><label>input sample rate</label><input id="nuna-isr" type="number" value="16000" style="min-width:120px"></div>
+          <div><label>samples / frame</label><input id="nuna-spf" type="number" value="960" style="min-width:120px"></div>
+          <button id="btn-nuna-ogg" class="secondary">Make .ogg</button>
+        </div>
+      </details>
+    </section>
+
+    <section class="card">
+      <h2>Status</h2>
+      <div id="status" class="row">
+        <span class="pill bad" id="conn-pill">disconnected</span>
+        <span id="conn-info"></span>
+        <button id="btn-disconnect" class="secondary">Disconnect</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Scan</h2>
+      <div class="row">
+        <label>seconds <input id="scan-seconds" type="number" value="5" min="1" max="30" style="min-width:80px"></label>
+        <button id="btn-scan">Scan</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label><input type="checkbox" id="scan-only-nuna"> show only Nuna devices</label>
+      </div>
+      <div id="scan-hint" style="margin-top:8px; font-size:11px; color:var(--muted); display:none;">
+        <strong>Windows Tip:</strong> If devices show as <em>(unnamed)</em>, try scanning for 10-15 seconds. 
+        Ensure "Location" is enabled in Windows Settings and that the device is not connected to any other app/phone.
+      </div>
+      <div style="margin-top:12px">
+        <table id="devices-table"><thead><tr><th>Name</th><th>Address</th><th>RSSI</th></tr></thead><tbody></tbody></table>
+      </div>
+    </section>
+
+    <section class="card" style="grid-column: 1 / -1;">
+      <h2>Services &amp; Characteristics</h2>
+      <div class="row">
+        <button id="btn-services" class="secondary">Refresh services</button>
+        <button id="btn-readall" class="secondary">Read all readable (probe metadata)</button>
+      </div>
+      <pre id="services-out" style="margin-top:12px">(connect to a device first)</pre>
+    </section>
+
+    <section class="card" style="grid-column: 1 / -1;">
+      <h2>Capture audio / file</h2>
+      <p style="margin:0 0 10px; color:var(--muted)">
+        Pick the notify characteristic(s) the device streams data on, optionally fire a "start" command,
+        then capture every notification to disk. Idle auto-stop kicks in after the device goes quiet.
+      </p>
+      <div class="row" style="align-items:flex-start">
+        <div style="flex:1; min-width:320px">
+          <label>Notify UUIDs (one per line)</label>
+          <textarea id="cap-uuids" rows="4" style="width:100%; background:var(--panel-2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:8px; font-family:ui-monospace,Menlo,monospace; font-size:12px;">0000a001-0000-1000-8000-00805f9b34fb
+0000a002-0000-1000-8000-00805f9b34fb
+0000a003-0000-1000-8000-00805f9b34fb</textarea>
+        </div>
+        <div style="flex:1; min-width:320px">
+          <label>Trigger (optional) — write hex to a char to start the transfer</label>
+          <input id="cap-trig-char" placeholder="trigger char UUID (e.g. 0000a002-...)">
+          <input id="cap-trig-hex" placeholder="trigger hex (e.g. 0102FF)" style="margin-top:6px">
+          <div style="margin-top:6px"><label>Idle auto-stop (ms): <input id="cap-idle" type="number" value="3000" min="0" style="min-width:120px"></label></div>
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="btn-cap-start">Start capture</button>
+        <button id="btn-cap-stop" class="secondary">Stop</button>
+        <span id="cap-id" style="color:var(--muted); font-family:ui-monospace,Menlo,monospace; font-size:12px"></span>
+      </div>
+
+      <div class="row" style="margin-top:12px; padding-top:10px; border-top:1px dashed var(--border)">
+        <span style="color:var(--muted); font-size:12px; min-width:100%">Send a command during the capture (this is what triggers the device to start streaming):</span>
+        <input id="send-char" placeholder="char UUID (e.g. 0000a002-...)" style="min-width:280px">
+        <input id="send-hex" placeholder="hex (e.g. 01 or 0102FF)">
+        <label><input type="checkbox" id="send-resp"> with response</label>
+        <button id="btn-send" class="secondary">Send</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <span style="color:var(--muted); font-size:12px">Quick triggers:</span>
+        <button class="secondary quick-trig" data-hex="01">01</button>
+        <button class="secondary quick-trig" data-hex="02">02</button>
+        <button class="secondary quick-trig" data-hex="0101">0101</button>
+        <button class="secondary quick-trig" data-hex="0102">0102</button>
+        <button class="secondary quick-trig" data-hex="fe01">FE 01</button>
+        <button class="secondary quick-trig" data-hex="55aa">55 AA</button>
+        <button class="secondary quick-trig" data-hex="aa55">AA 55</button>
+      </div>
+      <pre id="send-out" style="margin-top:8px">(no command sent yet)</pre>
+
+      <pre id="cap-status" style="margin-top:12px">(no active capture)</pre>
+      <div id="cap-files"></div>
+      <div class="row" style="margin-top:10px; align-items:flex-start; flex-wrap:wrap">
+        <div>
+          <label>Wrap as WAV (PCM only)</label>
+          <input id="wav-file" placeholder="path to .bin from manifest" style="min-width:360px">
+        </div>
+        <div>
+          <label>sample rate</label>
+          <input id="wav-rate" type="number" value="16000" style="min-width:120px">
+        </div>
+        <div>
+          <label>channels</label>
+          <input id="wav-channels" type="number" value="1" min="1" max="2" style="min-width:80px">
+        </div>
+        <div>
+          <label>width (bytes)</label>
+          <input id="wav-width" type="number" value="2" min="1" max="4" style="min-width:80px">
+        </div>
+        <div>
+          <label>skip header bytes</label>
+          <input id="wav-skip" type="number" value="0" min="0" style="min-width:120px">
+        </div>
+        <button id="btn-wav" class="secondary" style="align-self:flex-end">Make WAV</button>
+      </div>
+      <pre id="wav-out" style="margin-top:12px">(no wav yet)</pre>
+    </section>
+
+    <section class="card">
+      <h2>Read / Write</h2>
+      <div class="row">
+        <input id="char-uuid" placeholder="characteristic UUID">
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button id="btn-read" class="secondary">Read</button>
+        <input id="write-payload" placeholder="hex e.g. 0102FF or text:hello">
+        <button id="btn-write">Write</button>
+      </div>
+      <pre id="rw-out" style="margin-top:12px">(no result yet)</pre>
+    </section>
+
+    <section class="card">
+      <h2>Notifications stream</h2>
+      <div class="row">
+        <button id="btn-subscribe">Subscribe</button>
+        <button id="btn-unsubscribe" class="secondary">Unsubscribe</button>
+        <button id="btn-clear" class="secondary">Clear</button>
+      </div>
+      <div id="stream" style="margin-top:12px; max-height: 320px; overflow:auto; border:1px solid var(--border); border-radius: 6px;"></div>
+    </section>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    async function api(path, opts={}) {
+      const res = await fetch(path, { headers: {"Content-Type":"application/json"}, ...opts });
+      const text = await res.text();
+      let body; try { body = JSON.parse(text); } catch { body = text; }
+      if (!res.ok) {
+        const detail = (body && body.error) || res.statusText || "request failed";
+        throw Object.assign(new Error(`${res.status} ${detail}`), { body, status: res.status });
+      }
+      return body;
+    }
+    let currentPlatform = "";
+    function setStatus(s) {
+      const pill = $("conn-pill");
+      const info = $("conn-info");
+      currentPlatform = s.platform || "";
+      if (currentPlatform === "win32") {
+        $("scan-hint").style.display = "block";
+      } else {
+        $("scan-hint").style.display = "none";
+      }
+      if (s.connected) {
+        pill.className = "pill good"; pill.textContent = "connected";
+        const addrDisplay = (s.address.length > 17 && s.address.includes("-") && currentPlatform === "darwin") 
+          ? `${s.address} [UUID]` : s.address;
+        info.textContent = `${s.name || "(unnamed)"} — ${addrDisplay}` + (s.subscribed?.length ? `  ·  notifying: ${s.subscribed.join(", ")}` : "");
+      } else {
+        pill.className = "pill bad"; pill.textContent = "disconnected";
+        info.textContent = "";
+      }
+    }
+    async function refreshStatus() { setStatus(await api("/api/status")); }
+
+    // Nuna pendants advertise this 16-bit service. On Windows the friendly
+    // name often doesn't make it into the first advertisement frame, so we
+    // identify the pendant by service UUID instead and badge it in the row
+    // so the user can find it even when name == null.
+    const NUNA_SERVICE_UUID = "0000a000-0000-1000-8000-00805f9b34fb";
+    function isNuna(d) {
+      const name = (d.name || "").toLowerCase();
+      if (name.includes("nuna")) return true;
+      const uuids = (d.service_uuids || []).map(u => (u || "").toLowerCase());
+      return uuids.includes(NUNA_SERVICE_UUID);
+    }
+    function formatAddress(d, platform) {
+      const addr = d.address || "";
+      const isUUID = addr.length > 17 && addr.includes("-");
+      let out = `<code>${addr}</code>`;
+      
+      if (isUUID && platform === "darwin") {
+        out += ` <span style="color:var(--muted); font-size:10px" title="macOS hides hardware MAC addresses for privacy and uses a unique UUID instead.">[UUID]</span>`;
+      }
+      
+      // Try to find a potential MAC address in manufacturer data (6 bytes / 12 hex chars)
+      const mfgData = Object.values(d.manufacturer_data || {});
+      for (const hex of mfgData) {
+        if (hex.length === 12) {
+          const mac = hex.match(/.{1,2}/g).join(":").toUpperCase();
+          out += `<div style="margin-top:2px; font-size:10px; color:var(--good)">Possible MAC: <code>${mac}</code></div>`;
+          break;
+        }
+      }
+      return out;
+    }
+    function deviceLabel(d) {
+      if (d.name) return d.name;
+      if (isNuna(d)) return `<span class="pill good" style="margin-right:6px">Nuna</span><span style="color:var(--muted)">(name not advertised)</span>`;
+      const mfg = Object.entries(d.manufacturer_data || {})[0];
+      if (mfg) return `<span style="color:var(--muted)">(unnamed)</span> <code style="color:var(--muted); font-size:11px">mfg ${mfg[0]}:${mfg[1].slice(0, 12)}${mfg[1].length > 12 ? "…" : ""}</code>`;
+      return `<span style="color:var(--muted)">(unnamed)</span>`;
+    }
+
+    $("btn-scan").onclick = async () => {
+      const seconds = parseFloat($("scan-seconds").value || "5");
+      const tbody = $("devices-table").querySelector("tbody");
+      tbody.innerHTML = `<tr><td colspan="3" style="color:var(--muted)">scanning ${seconds}s…</td></tr>`;
+      try {
+        const { devices } = await api(`/api/scan?seconds=${seconds}`);
+        devices.sort((a, b) => {
+          // Float Nuna devices to the top, then sort by RSSI strength.
+          const an = isNuna(a) ? 1 : 0;
+          const bn = isNuna(b) ? 1 : 0;
+          if (an !== bn) return bn - an;
+          return (b.rssi ?? -999) - (a.rssi ?? -999);
+        });
+        const filtered = $("scan-only-nuna").checked ? devices.filter(isNuna) : devices;
+        tbody.innerHTML = filtered.map(d => `
+          <tr data-address="${d.address}" ${isNuna(d) ? 'style="background:rgba(74,222,128,.05)"' : ""}>
+            <td>${deviceLabel(d)}</td>
+            <td>${formatAddress(d, currentPlatform)}</td>
+            <td>${d.rssi ?? ""}</td>
+          </tr>`).join("") || `<tr><td colspan="3" style="color:var(--muted)">no devices found</td></tr>`;
+        tbody.querySelectorAll("tr[data-address]").forEach(tr => {
+          tr.onclick = async () => {
+            try {
+              setStatus(await api("/api/connect", { method: "POST", body: JSON.stringify({ address: tr.dataset.address }) }));
+            } catch (e) { alert("connect failed: " + e.message); }
+          };
+        });
+      } catch (e) { tbody.innerHTML = `<tr><td colspan="3" style="color:var(--bad)">${e.message}</td></tr>`; }
+    };
+
+    $("btn-disconnect").onclick = async () => { try { setStatus(await api("/api/disconnect", { method: "POST" })); } catch (e) { alert(e.message); } };
+
+    $("btn-services").onclick = async () => {
+      try {
+        const { services } = await api("/api/services");
+        $("services-out").textContent = services.map(s => {
+          const head = `service ${s.uuid}` + (s.description ? `  (${s.description})` : "");
+          const chars = s.characteristics.map(c => `  · ${c.uuid}  [${c.properties.join(",")}]`).join("\n");
+          return head + "\n" + chars;
+        }).join("\n\n") || "(no services)";
+      } catch (e) { $("services-out").textContent = "error: " + e.message; }
+    };
+
+    $("btn-read").onclick = async () => {
+      const char = $("char-uuid").value.trim();
+      if (!char) return;
+      try { $("rw-out").textContent = JSON.stringify(await api(`/api/read?char=${encodeURIComponent(char)}`), null, 2); }
+      catch (e) { $("rw-out").textContent = "error: " + e.message; }
+    };
+
+    $("btn-write").onclick = async () => {
+      const char = $("char-uuid").value.trim();
+      const raw = $("write-payload").value;
+      if (!char || !raw) return;
+      const body = { char };
+      if (raw.startsWith("text:")) body.text = raw.slice(5); else body.hex = raw;
+      try { $("rw-out").textContent = JSON.stringify(await api("/api/write", { method: "POST", body: JSON.stringify(body) }), null, 2); }
+      catch (e) { $("rw-out").textContent = "error: " + e.message; }
+    };
+
+    $("btn-subscribe").onclick = async () => {
+      const char = $("char-uuid").value.trim(); if (!char) return;
+      try { setStatus(await api("/api/subscribe", { method: "POST", body: JSON.stringify({ char }) })); await refreshStatus(); } catch (e) { alert(e.message); }
+    };
+    $("btn-unsubscribe").onclick = async () => {
+      const char = $("char-uuid").value.trim(); if (!char) return;
+      try { setStatus(await api("/api/unsubscribe", { method: "POST", body: JSON.stringify({ char }) })); await refreshStatus(); } catch (e) { alert(e.message); }
+    };
+    $("btn-clear").onclick = () => { $("stream").innerHTML = ""; };
+
+    $("btn-readall").onclick = async () => {
+      $("services-out").textContent = "reading…";
+      try {
+        const { values } = await api("/api/read-all");
+        $("services-out").textContent = values.map(v => {
+          const props = `[${(v.properties||[]).join(",")}]`;
+          const head = `${v.uuid} ${props}  service=${v.service}`;
+          if (v.error) return head + "\n  ! " + v.error;
+          const utf = v.utf8 ? `  "${v.utf8}"` : "";
+          const u16 = v.le_u16 != null ? `  le_u16=${v.le_u16}` : "";
+          const u32 = v.le_u32 != null ? `  le_u32=${v.le_u32}` : "";
+          return head + `\n  ${v.hex || "(empty)"}${utf}${u16}${u32}  (${v.len}B)`;
+        }).join("\n\n");
+      } catch (e) { $("services-out").textContent = "error: " + e.message; }
+    };
+
+    let capId = null, capTimer = null;
+    function parseCapUuids() {
+      return $("cap-uuids").value.split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
+    }
+    function renderCapFiles(s) {
+      const files = Object.entries(s.files || {}).map(([u, p]) => {
+        const bytes = (s.bytes && s.bytes[u]) || 0;
+        const pkts = (s.packets && s.packets[u]) || 0;
+        const dim = bytes === 0 ? "color:var(--muted)" : "";
+        return `<div class="row" style="margin-top:6px;${dim}"><code>${u}</code> · ${bytes}B / ${pkts} pkts · <a href="/api/record/file?path=${encodeURIComponent(p)}">${p.split("/").pop()}</a> <button class="secondary" data-path="${p}">Use for WAV</button></div>`;
+      }).join("");
+      $("cap-files").innerHTML = files;
+      $("cap-files").querySelectorAll("button[data-path]").forEach(b => b.onclick = () => $("wav-file").value = b.dataset.path);
+    }
+    function renderCapStatus(s, finalNote) {
+      const total = s.total_bytes || 0;
+      const banner = total === 0
+        ? `[!] 0 bytes received. The device never sent notifications during this session.\n    Send a trigger command (panel above) — most BLE devices need an explicit "start transfer" write.\n\n`
+        : `[ok] received ${total} bytes / ${s.total_packets} packets in ${(s.elapsed_s||0).toFixed(2)}s\n    files saved under: ${s.dir}\n\n`;
+      $("cap-status").textContent = banner + (finalNote ? finalNote + "\n\n" : "") + JSON.stringify(s, null, 2);
+    }
+    async function refreshCap() {
+      if (!capId) return;
+      try {
+        const s = await api(`/api/record/status?id=${encodeURIComponent(capId)}`);
+        renderCapStatus(s);
+        renderCapFiles(s);
+        if (s.stopped) { clearInterval(capTimer); capTimer = null; }
+      } catch (e) { $("cap-status").textContent = "status error: " + e.message; }
+    }
+    $("btn-cap-start").onclick = async () => {
+      const uuids = parseCapUuids();
+      if (!uuids.length) return alert("provide at least one UUID");
+      const idle_ms = parseInt($("cap-idle").value || "3000", 10);
+      const trigChar = $("cap-trig-char").value.trim();
+      const trigHex = $("cap-trig-hex").value.trim();
+      const body = { uuids, idle_ms };
+      if (trigChar && trigHex) body.trigger = { char: trigChar, hex: trigHex };
+      try {
+        const s = await api("/api/record/start", { method: "POST", body: JSON.stringify(body) });
+        capId = s.id;
+        $("cap-id").textContent = "session: " + capId;
+        const errs = s.subscribe_errors || {};
+        if (Object.keys(errs).length) {
+          $("send-out").textContent = "subscribe errors:\n" + JSON.stringify(errs, null, 2);
+        }
+        if (s.trigger && s.trigger.ok === false) {
+          $("send-out").textContent = ($("send-out").textContent || "") +
+            "\ntrigger error: " + s.trigger.error;
+        }
+        clearInterval(capTimer);
+        capTimer = setInterval(refreshCap, 500);
+        refreshCap();
+        await refreshStatus();
+      } catch (e) { alert("start failed: " + e.message); }
+    };
+    $("btn-cap-stop").onclick = async () => {
+      if (!capId) return;
+      try {
+        const m = await api("/api/record/stop", { method: "POST", body: JSON.stringify({ id: capId }) });
+        clearInterval(capTimer); capTimer = null;
+        renderCapStatus(m, "session stopped.");
+        renderCapFiles(m);
+        await refreshStatus();
+      } catch (e) {
+        $("cap-status").textContent = "stop failed: " + e.message + "\n\n" + ($("cap-status").textContent || "");
+      }
+    };
+
+    async function sendCommand(hex) {
+      const char = $("send-char").value.trim();
+      if (!char) { $("send-out").textContent = "set the char UUID first"; return; }
+      if (!hex) { $("send-out").textContent = "no hex to send"; return; }
+      const body = { char, hex, response: $("send-resp").checked };
+      const ts = new Date().toISOString().substr(11,12);
+      try {
+        const r = await api("/api/write", { method: "POST", body: JSON.stringify(body) });
+        $("send-out").textContent = `[${ts}] sent ${hex} -> ${char}\n` + JSON.stringify(r, null, 2);
+      } catch (e) {
+        $("send-out").textContent = `[${ts}] send ${hex} -> ${char}\nFAILED: ${e.message}`;
+      }
+    }
+    $("btn-send").onclick = () => sendCommand($("send-hex").value.trim());
+    document.querySelectorAll(".quick-trig").forEach(b => {
+      b.onclick = () => { $("send-hex").value = b.dataset.hex; sendCommand(b.dataset.hex); };
+    });
+    $("btn-wav").onclick = async () => {
+      const file = $("wav-file").value.trim();
+      if (!file) return alert("paste a captured .bin path first");
+      const body = {
+        file,
+        sample_rate: parseInt($("wav-rate").value, 10),
+        channels: parseInt($("wav-channels").value, 10),
+        sample_width: parseInt($("wav-width").value, 10),
+        skip_header_bytes: parseInt($("wav-skip").value, 10),
+      };
+      try {
+        const r = await api("/api/record/wav", { method: "POST", body: JSON.stringify(body) });
+        $("wav-out").innerHTML = `<div>${JSON.stringify(r, null, 2)}</div><div style="margin-top:8px"><a href="/api/record/file?path=${encodeURIComponent(r.out)}">download ${r.out.split("/").pop()}</a></div>`;
+      } catch (e) { $("wav-out").textContent = "error: " + e.message; }
+    };
+
+    const es = new EventSource("/api/stream");
+    es.onmessage = (ev) => {
+      try {
+        const d = JSON.parse(ev.data);
+        const ts = new Date((d.ts || Date.now()/1000) * 1000).toISOString().substr(11,12);
+        const line = document.createElement("div");
+        line.className = "stream-line";
+        const text = d.utf8 ? `  "${d.utf8}"` : "";
+        line.innerHTML = `<span class="ts">${ts}</span><span class="uuid">${d.uuid}</span><span>${d.hex}</span><span style="color:var(--muted)">${text}</span>`;
+        const box = $("stream");
+        const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
+        box.appendChild(line);
+        if (stick) box.scrollTop = box.scrollHeight;
+      } catch {}
+    };
+
+    refreshStatus();
+    setInterval(refreshStatus, 5000);
+
+    async function refreshRecordedList() {
+      try {
+        const r = await api("/api/nuna/recorded");
+        const list = (r.sessions || []);
+        const box = $("nuna-recorded-list");
+        if (!list.length) { box.innerHTML = "<div style='color:var(--muted)'>(none yet)</div>"; return; }
+        box.innerHTML = list.map(s => {
+          const sizeKB = (s.audio_ogg_bytes / 1024).toFixed(1);
+          return `<div class="row" style="margin-top:4px"><code>${s.id}</code> · ${sizeKB} KB · <a href="#" data-play-id="${s.id}">play</a> · <a href="${s.download_url}" download>download</a></div>`;
+        }).join("");
+        box.querySelectorAll("a[data-play-id]").forEach(a => a.onclick = (e) => {
+          e.preventDefault();
+          showNunaPlayer(a.dataset.playId, `from disk · ${a.parentElement.textContent.split('·')[1].trim()}`);
+        });
+      } catch (e) { /* silently ignore */ }
+    }
+    refreshRecordedList();
+
+    let nunaTimer = null, nunaActiveId = null, nunaAudioId = null;
+    function fmtBytes(n) {
+      if (n < 1024) return `${n} B`;
+      if (n < 1024*1024) return `${(n/1024).toFixed(1)} KB`;
+      return `${(n/1024/1024).toFixed(2)} MB`;
+    }
+    function showNunaPlayer(sessionId, meta) {
+      // Cache-bust so the <audio> element refetches after a re-mux of the
+      // same session id.
+      const url = `/api/nuna/audio?id=${encodeURIComponent(sessionId)}&t=${Date.now()}`;
+      const audio = $("nuna-audio");
+      if (nunaAudioId !== sessionId || audio.src.indexOf(`id=${encodeURIComponent(sessionId)}`) < 0) {
+        audio.src = url;
+        audio.load();
+      } else {
+        // Force a refresh on every update to pick up re-muxes
+        audio.src = url;
+        audio.load();
+      }
+      nunaAudioId = sessionId;
+      $("nuna-download").href = `/api/nuna/audio?id=${encodeURIComponent(sessionId)}&download=1`;
+      $("nuna-download").setAttribute("download", `${sessionId}.ogg`);
+      $("nuna-player-meta").textContent = meta || "";
+      $("nuna-player").style.display = "block";
+    }
+    function hideNunaPlayer() {
+      $("nuna-player").style.display = "none";
+      const a = $("nuna-audio");
+      a.removeAttribute("src");
+      a.load();
+      nunaAudioId = null;
+    }
+    function describeSession(s) {
+      const dur = (s.last_audio_at && s.first_audio_at) ? (s.last_audio_at - s.first_audio_at) : 0;
+      return `${fmtBytes(s.audio_bytes||0)} · ${s.audio_packets||0} frames · ${dur.toFixed(2)}s`;
+    }
+    function renderNuna(s) {
+      const a = s && s.active;
+      // Pick a session to play: prefer active one, else most-recent finished
+      const sessions = (s && s.sessions) || [];
+      const finished = sessions.filter(x => x.audio_ogg_ready).sort((x, y) => (y.started_at||0) - (x.started_at||0));
+      const playable = (a && a.audio_ogg_ready) ? a : finished[0];
+
+      if (!a) {
+        $("nuna-status").textContent = JSON.stringify(s, null, 2);
+        $("nuna-files").innerHTML = "";
+        $("nuna-rate").textContent = "";
+        if (playable) showNunaPlayer(playable.id, describeSession(playable));
+        else hideNunaPlayer();
+        return;
+      }
+      nunaActiveId = a.id;
+      const dur = (a.last_audio_at && a.first_audio_at) ? (a.last_audio_at - a.first_audio_at) : 0;
+      const hsTag = a.handshake_completed_sent ? "HS✓" : (a.handshake_response_match === false ? "HS✗" : "HS…");
+      $("nuna-rate").textContent =
+        `${hsTag} · ${fmtBytes(a.audio_bytes||0)} · ${a.audio_packets||0} frames (${a.audio_chunks||0} chunks) · ${(a.avg_byte_rate||0).toFixed(0)} B/s · span ${dur.toFixed(2)}s`;
+      $("nuna-status").textContent = JSON.stringify(a, null, 2);
+      const links = [
+        `<div class="row" style="margin-top:6px"><code>${a.id}</code> · ${a.dir}</div>`,
+        `<div class="row" style="margin-top:6px"><a href="/api/record/file?path=${encodeURIComponent(a.opus_packets)}">audio.opus_packets.bin</a> · <a href="/api/record/file?path=${encodeURIComponent(a.raw)}">raw_notify.bin</a></div>`,
+      ];
+      $("nuna-files").innerHTML = links.join("");
+      if (playable) showNunaPlayer(playable.id, describeSession(playable));
+      else hideNunaPlayer();
+    }
+    async function refreshNuna() {
+      try {
+        const s = await api("/api/nuna/status");
+        renderNuna(s);
+        if (s && !s.active && nunaTimer) { clearInterval(nunaTimer); nunaTimer = null; }
+      } catch (e) { $("nuna-status").textContent = "status error: " + e.message; }
+    }
+    $("btn-nuna-start").onclick = async () => {
+      $("nuna-status").textContent = "scanning + connecting...";
+      $("nuna-events").innerHTML = "";
+      const body = {
+        pair: $("nuna-pair").checked,
+        force_reconnect: $("nuna-force").checked,
+        verification_code: ($("nuna-vc").value || "123456").slice(0, 6),
+      };
+      const duuid = $("nuna-duuid").value.trim();
+      if (duuid) body.device_uuid = duuid;
+      try {
+        const s = await api("/api/nuna/start", { method: "POST", body: JSON.stringify(body) });
+        nunaActiveId = s.id;
+        clearInterval(nunaTimer);
+        nunaTimer = setInterval(refreshNuna, 500);
+        refreshNuna();
+        await refreshStatus();
+      } catch (e) { $("nuna-status").textContent = "start failed: " + e.message; }
+    };
+    async function nunaStopRequest(force) {
+      try {
+        const m = await api("/api/nuna/stop", { method: "POST", body: JSON.stringify({ force: !!force }) });
+        clearInterval(nunaTimer); nunaTimer = null;
+        $("nuna-status").textContent = JSON.stringify(m, null, 2);
+        if (m && m.id) nunaActiveId = m.id;
+        // The server auto-builds .ogg if any frames were captured. Show the
+        // player immediately so the user can preview without extra clicks.
+        if (m && m.audio_ogg && m.id) {
+          showNunaPlayer(m.id, describeSession(m));
+        } else if (m && m.id) {
+          // Fall back: maybe the file already existed from a previous run
+          await refreshNuna();
+        }
+        await refreshStatus();
+      } catch (e) { $("nuna-status").textContent = (force ? "force stop failed: " : "stop failed: ") + e.message; }
+    }
+    $("btn-nuna-stop").onclick = () => nunaStopRequest(false);
+    $("btn-nuna-force-stop").onclick = () => nunaStopRequest(true);
+    $("btn-nuna-remix").onclick = () => $("btn-nuna-ogg").click();
+    $("btn-nuna-mmwave").onclick = async () => {
+      try {
+        const r = await api("/api/nuna/try-mmwave", { method: "POST", body: JSON.stringify({}) });
+        $("nuna-status").textContent = "mmWave probe result:\n" + JSON.stringify(r, null, 2);
+      } catch (e) { $("nuna-status").textContent = "mmwave probe failed: " + e.message; }
+    };
+    $("btn-nuna-ogg").onclick = async () => {
+      // Prefer the most recently played session id — falls back to the
+      // active one. This lets Re-mux work after Stop, when the active
+      // session is gone but the user still wants to retune params.
+      const targetId = nunaAudioId || nunaActiveId;
+      if (!targetId) return alert("no nuna session yet — start one first");
+      const body = {
+        id: targetId,
+        channels: parseInt($("nuna-ch").value, 10),
+        input_sample_rate: parseInt($("nuna-isr").value, 10),
+        samples_per_frame: parseInt($("nuna-spf").value, 10),
+      };
+      try {
+        const r = await api("/api/nuna/ogg", { method: "POST", body: JSON.stringify(body) });
+        showNunaPlayer(targetId, `${r.packets} frames · ~${r.approx_duration_s.toFixed(2)}s · ${fmtBytes(r.bytes_written)}`);
+        $("nuna-status").textContent = "OGG (re)muxed:\n" + JSON.stringify(r, null, 2)
+          + "\n\n" + ($("nuna-status").textContent || "");
+      } catch (e) { $("nuna-status").textContent = "ogg failed: " + e.message; }
+    };
+
+    // light-up the rate indicator from the SSE stream too (low-latency feedback)
+    es.addEventListener("message", (ev) => {
+      try {
+        const d = JSON.parse(ev.data);
+        if (d.type === "nuna_audio") {
+          $("nuna-rate").textContent =
+            `LIVE · ${fmtBytes(d.total_bytes||0)} · ${d.total_packets||0} frames · last frame ${d.frame_bytes}B (id=${d.frame_id})`;
+        } else if (d.type === "nuna_event") {
+          const ts = new Date((d.ts || Date.now()/1000) * 1000).toISOString().substr(11,12);
+          const div = document.createElement("div");
+          const detail = Object.entries(d).filter(([k]) => !["type","name","ts"].includes(k))
+                                          .map(([k,v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`).join(" ");
+          div.textContent = `[${ts}] ${d.name}  ${detail}`;
+          if (d.name && d.name.endsWith("_err")) div.style.color = "var(--bad)";
+          if (d.name === "handshake_completed_sent" || d.name === "switch_record_on_sent" || d.name === "audio_enable_sent") div.style.color = "var(--good)";
+          if (d.name === "handshake_response" && d.match === false) div.style.color = "var(--bad)";
+          if (d.name === "handshake_aborted" || d.name === "handshake_mismatch" || d.name === "handshake_timeout") div.style.color = "var(--bad)";
+          const box = $("nuna-events");
+          box.appendChild(div);
+          box.scrollTop = box.scrollHeight;
+        } else if (d.type === "nuna_raw") {
+          const ts = new Date((d.ts || Date.now()/1000) * 1000).toISOString().substr(11,12);
+          const div = document.createElement("div");
+          div.style.color = "var(--good)";
+          div.textContent = `[${ts}] RAW ${d.uuid.substr(4,4)} +${d.len}B  ${d.hex}`;
+          const box = $("nuna-events");
+          box.appendChild(div);
+          box.scrollTop = box.scrollHeight;
+        }
+      } catch {}
+    });
+  </script>
+</body>
+</html>
