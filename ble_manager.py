@@ -18,10 +18,14 @@ from pathlib import Path
 from queue import Queue
 from typing import Any, Callable, Optional
 
-from bleak import BleakClient, BleakScanner
+from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
-from bleak.backends.device import BLEDevice
-from bleak.backends.scanner import AdvertisementData
+
+from ble_scan_util import (
+    find_ble_device_by_name,
+    scan_ble_devices,
+    scan_timeout_budget,
+)
 
 from nuna_protocol import (
     CHAR_RECORDING as NUNA_RECORDING,
@@ -420,7 +424,7 @@ class BleManager:
     # ---------- public sync API used by Flask ----------
 
     def scan(self, seconds: float = 5.0) -> list[dict[str, Any]]:
-        return self._submit(self._scan(seconds), timeout=seconds + 10)
+        return self._submit(self._scan(seconds), timeout=scan_timeout_budget(seconds))
 
     def connect(self, address: str, timeout: float = 15.0) -> dict[str, Any]:
         return self._submit(self._connect(address, timeout), timeout=timeout + 10)
@@ -826,30 +830,14 @@ class BleManager:
         if self._client is None or not self._client.is_connected:
             target: Any = address
             if not target:
-                found: dict[str, Any] = {"d": None}
-                done = asyncio.Event()
-
-                def cb(d: BLEDevice, adv: AdvertisementData) -> None:
-                    n = d.name or adv.local_name or ""
-                    if name_substr.lower() in n.lower() and not found["d"]:
-                        found["d"] = d
-                        done.set()
-
-                scanner = BleakScanner(detection_callback=cb)
-                await scanner.start()
-                try:
-                    await asyncio.wait_for(done.wait(), scan_seconds)
-                except asyncio.TimeoutError:
-                    pass
-                finally:
-                    await scanner.stop()
-                if found["d"] is None:
+                device = await find_ble_device_by_name(name_substr, scan_seconds)
+                if device is None:
                     raise RuntimeError(
                         f"Nuna not found by name~{name_substr!r}. Power-cycle "
                         f"the device, or click Connect first if you already have "
                         f"its address."
                     )
-                target = found["d"]
+                target = device
 
             evt("connecting", pair=pair)
             self._client = BleakClient(target, timeout=20.0, pair=pair)
@@ -858,7 +846,16 @@ class BleManager:
             self._connected_address = (
                 target.address if hasattr(target, "address") else str(target)
             )
-            self._connected_name = getattr(target, "name", None) or "nuna"
+            name = getattr(target, "name", None)
+            if name and str(name).strip().lower() not in {
+                "",
+                "unknown",
+                "(unknown)",
+                "unnamed",
+            }:
+                self._connected_name = str(name).strip()
+            else:
+                self._connected_name = "nuna"
             self._subscribed.clear()
             with self._lock:
                 self._notify_callbacks.clear()
@@ -1100,26 +1097,7 @@ class BleManager:
         return manifest
 
     async def _scan(self, seconds: float) -> list[dict[str, Any]]:
-        found: dict[str, dict[str, Any]] = {}
-
-        def _on_detect(device: BLEDevice, adv: AdvertisementData) -> None:
-            found[device.address] = {
-                "address": device.address,
-                "name": device.name or adv.local_name,
-                "rssi": adv.rssi,
-                "service_uuids": list(adv.service_uuids or []),
-                "manufacturer_data": {
-                    str(k): v.hex() for k, v in (adv.manufacturer_data or {}).items()
-                },
-            }
-
-        scanner = BleakScanner(detection_callback=_on_detect)
-        await scanner.start()
-        try:
-            await asyncio.sleep(seconds)
-        finally:
-            await scanner.stop()
-        return list(found.values())
+        return await scan_ble_devices(seconds)
 
     async def _connect(self, address: str, timeout: float) -> dict[str, Any]:
         if self._client is not None and self._client.is_connected:

@@ -20,8 +20,14 @@ import sys
 import time
 from pathlib import Path
 
-from bleak import BleakClient, BleakScanner
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
+
+from ble_scan_util import advertisement_name, make_scanner, name_matches
 
 DEFAULT_ADDRESS = "22347659-9F8F-0161-6A94-2578A69C26A6"
 
@@ -68,18 +74,21 @@ async def find_device(
         if matched["device"]:
             return
         addr_ok = target_address and device.address.lower() == target_address.lower()
-        name = device.name or adv.local_name or ""
-        name_ok = target_name_substr and target_name_substr.lower() in name.lower()
+        name_ok = (
+            bool(target_name_substr)
+            and name_matches(target_name_substr, device, adv)
+        )
         if addr_ok or name_ok:
             matched["device"] = device
             matched["adv"] = adv
+            name = advertisement_name(device, adv) or ""
             print(
                 f"[scan] FOUND: name={name!r} addr={device.address} "
                 f"rssi={getattr(adv, 'rssi', '?')}"
             )
             done.set()
 
-    scanner = BleakScanner(detection_callback=_cb)
+    scanner = make_scanner(detection_callback=_cb)
     await scanner.start()
     try:
         await asyncio.wait_for(done.wait(), timeout=total_seconds)

@@ -9,11 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from pathlib import Path
 
-from bleak import BleakClient, BleakScanner
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
+
+from ble_scan_util import make_scanner, name_matches
 
 NAME = "nuna"
 NOTIFY_UUIDS = [
@@ -59,11 +66,10 @@ async def find():
     found = {"d": None}
     done = asyncio.Event()
     def cb(d, adv):
-        n = d.name or adv.local_name or ""
-        if NAME in n.lower() and not found["d"]:
+        if name_matches(NAME, d, adv) and not found["d"]:
             found["d"] = d
             done.set()
-    s = BleakScanner(detection_callback=cb)
+    s = make_scanner(detection_callback=cb)
     await s.start()
     try:
         await asyncio.wait_for(done.wait(), 25)

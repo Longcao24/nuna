@@ -29,7 +29,9 @@ import wave
 from collections import Counter
 from pathlib import Path
 
-from bleak import BleakClient, BleakScanner
+from bleak import BleakClient
+
+from ble_scan_util import advertisement_name, make_scanner, name_matches
 
 from nuna_protocol import (
     CHAR_NOTIFY,
@@ -51,13 +53,15 @@ async def find_device(name_substr: str, timeout: float = 15.0):
     done = asyncio.Event()
 
     def cb(d, adv):
-        n = d.name or adv.local_name or ""
-        if name_substr.lower() in n.lower() and not found["d"]:
+        if name_matches(name_substr, d, adv) and not found["d"]:
             found["d"] = d
-            print(f"[scan] FOUND: {d.address} name={n!r} rssi={getattr(adv, 'rssi', '?')}")
+            print(
+                f"[scan] FOUND: {d.address} name={advertisement_name(d, adv)!r} "
+                f"rssi={getattr(adv, 'rssi', '?')}"
+            )
             done.set()
 
-    s = BleakScanner(detection_callback=cb)
+    s = make_scanner(detection_callback=cb)
     await s.start()
     try:
         await asyncio.wait_for(done.wait(), timeout)
