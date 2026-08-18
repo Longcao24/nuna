@@ -387,6 +387,17 @@ def nuna_ogg() -> Response:
         return _err(str(exc), 400)
 
 
+@app.route("/api/nuna/hr", methods=["GET"])
+def api_nuna_hr() -> Response:
+    import urllib.request
+    try:
+        req = urllib.request.Request("http://localhost:8080/hr")
+        with urllib.request.urlopen(req, timeout=2.0) as response:
+            return jsonify(json.loads(response.read().decode()))
+    except Exception as e:
+        return jsonify({"hr": None, "timestamp": None, "error": str(e)})
+
+
 # Backward-compat: old UI calls /api/nuna/wav, route it to the new ogg muxer.
 app.add_url_rule(
     "/api/nuna/wav", view_func=nuna_ogg, methods=["POST"], endpoint="nuna_wav_compat"

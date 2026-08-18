@@ -44,6 +44,8 @@ from nuna_protocol import (
 # Backward-compat aliases (existing methods reference these names)
 NUNA_NOTIFY = NUNA_STATUS
 NUNA_WRITE = NUNA_TRANSFER
+NUNA_AUDIO_IDLE_STOP_S = 3.0
+NUNA_START_NO_AUDIO_STALE_S = 30.0
 
 
 def _norm(uuid: str) -> str:
@@ -174,9 +176,12 @@ class _NunaSession:
 
         self.first_audio_at: Optional[float] = None
         self.last_audio_at: Optional[float] = None
+        self.last_notify_at: Optional[float] = None
         self.started_at = time.time()
         self.stopped = False
         self.last_battery: Optional[str] = None
+        self.ble_disconnected_at: Optional[float] = None
+        self.reconnecting = False
 
         # handshake state
         self.handshake_event: Optional[asyncio.Event] = None  # set externally
@@ -219,6 +224,7 @@ class _NunaSession:
         with self._lock:
             if self.stopped:
                 return
+            self.last_notify_at = time.time()
             try:
                 self.raw_file.write(struct.pack("<HH", len(char_uuid), len(payload)))
                 self.raw_file.write(char_uuid.encode("ascii", "replace"))
@@ -245,6 +251,49 @@ class _NunaSession:
                 "type": "nuna_event", "name": name, "uuid": char_uuid,
                 "hex": body.hex(), "ts": time.time(),
             })
+        elif mtype == NunaMsgType.SENSOR_DATA:
+            if len(body) >= 9:
+                import struct
+                from datetime import datetime
+                import urllib.request
+                import json
+                
+                s_type = body[0]
+                s_ts = struct.unpack("<Q", body[1:9])[0]
+                s_raw = body[9:].hex().upper()
+                s_date = datetime.fromtimestamp(s_ts/1000.0).strftime("%Y-%m-%d %H:%M:%S")
+                
+                payload = {
+                    "type": s_type,
+                    "timestamp": s_ts,
+                    "date": s_date,
+                    "raw": s_raw
+                }
+                
+                publish({
+                    "type": "nuna_event", "name": "sensor_data", "uuid": char_uuid,
+                    "payload": payload, "ts": time.time(),
+                })
+                
+                # Send to bridge in a fire-and-forget way
+                def send_to_bridge():
+                    try:
+                        req = urllib.request.Request(
+                            "http://localhost:8080/process", 
+                            data=json.dumps(payload).encode('utf-8'),
+                            headers={'Content-Type': 'application/json'}
+                        )
+                        urllib.request.urlopen(req, timeout=1.0)
+                    except Exception as e:
+                        pass
+                
+                import threading
+                threading.Thread(target=send_to_bridge, daemon=True).start()
+            else:
+                publish({
+                    "type": "nuna_event", "name": "sensor_data_err", "uuid": char_uuid,
+                    "hex": body.hex(), "len": len(body), "ts": time.time(),
+                })
         else:
             publish({
                 "type": "nuna_event", "name": name, "uuid": char_uuid,
@@ -363,6 +412,7 @@ class _NunaSession:
             "started_at": self.started_at,
             "first_audio_at": self.first_audio_at,
             "last_audio_at": self.last_audio_at,
+            "last_notify_at": self.last_notify_at,
             "audio_packets": self.audio_packets,
             "audio_bytes": self.audio_bytes,
             "audio_chunks": self.audio_chunks,
@@ -596,10 +646,42 @@ class BleManager:
     def nuna_stop(self, force: bool = False) -> dict[str, Any]:
         return self._submit(self._nuna_stop(force=force), timeout=15)
 
+    def _active_nuna_session(self) -> Optional["_NunaSession"]:
+        return next((s for s in self._nuna_sessions.values() if not s.stopped), None)
+
+    def _nuna_stale_reason(
+        self,
+        session: "_NunaSession",
+        *,
+        now: Optional[float] = None,
+        include_no_audio: bool = False,
+    ) -> Optional[str]:
+        if session.stopped:
+            return "stopped"
+        connected = self._client is not None and self._client.is_connected
+        now = now or time.time()
+        if not connected:
+            if getattr(session, "ble_disconnected_at", None) is None:
+                session.ble_disconnected_at = now
+            idle_s = now - session.ble_disconnected_at
+            if idle_s >= 60.0:  # Timeout after 60 seconds of disconnected state
+                return f"ble_disconnected_timeout_{idle_s:.1f}s"
+            return "ble_needs_reconnect"
+        else:
+            session.ble_disconnected_at = None
+
+        if session.last_audio_at is not None:
+            idle_s = now - session.last_audio_at
+            if idle_s >= NUNA_AUDIO_IDLE_STOP_S:
+                return f"audio_idle_{idle_s:.1f}s"
+        if include_no_audio and session.switch_record_sent and session.audio_packets == 0:
+            idle_s = now - session.started_at
+            if idle_s >= NUNA_START_NO_AUDIO_STALE_S:
+                return f"no_audio_after_{idle_s:.1f}s"
+        return None
+
     def nuna_status(self) -> dict[str, Any]:
-        active = next(
-            (s for s in self._nuna_sessions.values() if not s.stopped), None
-        )
+        active = self._active_nuna_session()
         return {
             "active": active.status() if active else None,
             "sessions": [s.status() for s in self._nuna_sessions.values()],
@@ -754,6 +836,39 @@ class BleManager:
                         self.stop_recording(session.id)
                     except Exception:
                         pass
+            for session in list(self._nuna_sessions.values()):
+                if session.stopped or session.last_audio_at is None:
+                    continue
+                reason = self._nuna_stale_reason(session, now=now)
+                if not reason:
+                    continue
+
+                if reason == "ble_needs_reconnect":
+                    if getattr(session, "reconnecting", False):
+                        continue
+                    if not getattr(self, "_connected_address", None):
+                        continue
+                    session.reconnecting = True
+                    asyncio.run_coroutine_threadsafe(
+                        self._nuna_reconnect(session, self._connected_address),
+                        self._loop
+                    )
+                    continue
+
+                try:
+                    self._publish({
+                        "type": "nuna_event",
+                        "name": "auto_stop_audio_idle",
+                        "session": session.id,
+                        "reason": reason,
+                        "ts": now,
+                    })
+                    self.nuna_stop(force=False)
+                except Exception:
+                    try:
+                        self.nuna_stop(force=True)
+                    except Exception:
+                        pass
 
     # ---------- SSE pub/sub for notifications ----------
 
@@ -793,20 +908,28 @@ class BleManager:
         account_code: int = 0,
         handshake_timeout_s: float = 5.0,
     ) -> dict[str, Any]:
-        active = next(
-            (s for s in self._nuna_sessions.values() if not s.stopped), None
-        )
-        if active is not None:
-            if force_reconnect:
-                await self._nuna_stop(force=True)
-            else:
-                raise RuntimeError(
-                    f"a Nuna session is already active ({active.id}). "
-                    f"Stop it first, or check 'force reconnect' to clear it."
-                )
-
         def evt(name: str, **kwargs: Any) -> None:
             self._publish({"type": "nuna_event", "name": name, "ts": time.time(), **kwargs})
+
+        active = self._active_nuna_session()
+        if active is not None:
+            if force_reconnect:
+                evt("force_stop_existing_session", session=active.id)
+                await self._nuna_stop(force=True)
+            else:
+                stale_reason = self._nuna_stale_reason(active, include_no_audio=True)
+                if stale_reason:
+                    evt(
+                        "auto_stop_stale_session",
+                        session=active.id,
+                        reason=stale_reason,
+                    )
+                    await self._nuna_stop(force=True)
+                else:
+                    status = active.status()
+                    status["already_active"] = True
+                    evt("reuse_active_session", session=active.id)
+                    return status
 
         evt("build_v5_switch_record")
 
@@ -1016,6 +1139,74 @@ class BleManager:
         nsession._hb_task = asyncio.create_task(_heartbeat())  # type: ignore[attr-defined]
         return nsession.status()
 
+    async def _nuna_reconnect(self, session: "_NunaSession", address: str) -> None:
+        def evt(name: str, **kwargs: Any) -> None:
+            self._publish({"type": "nuna_event", "name": name, "session": session.id, "ts": time.time(), **kwargs})
+            
+        evt("reconnect_started", address=address)
+        try:
+            # 1. Scan and wait for device to be reachable
+            found = False
+            for _ in range(15): # up to ~30 seconds
+                if session.stopped:
+                    return
+                try:
+                    device = await BleakScanner.find_device_by_address(address, timeout=2.0)
+                    if device is not None:
+                        found = True
+                        break
+                except Exception:
+                    pass
+                if session.stopped:
+                    return
+                
+            if not found:
+                evt("reconnect_failed", error="device_not_found_in_scan")
+                session.reconnecting = False
+                return
+
+            evt("reconnect_found", msg="Device found in scan, attempting connect")
+            
+            # 2. Connect
+            self._client = BleakClient(address, timeout=20.0)
+            await self._client.connect()
+            
+            # 3. Resubscribe
+            self._subscribed.clear()
+            for u in (NUNA_STATUS, NUNA_TRANSFER, NUNA_RECORDING):
+                await self._subscribe(u)
+                
+            # 4. Handshake
+            session.handshake_event.clear()
+            req_pkt = handshake_request_packet(
+                verification_code=session.verification_code,
+                device_uuid="",
+                account_code="",
+            )
+            await self._client.write_gatt_char(NUNA_TRANSFER, req_pkt, response=True)
+            await asyncio.wait_for(session.handshake_event.wait(), timeout=5.0)
+            
+            # 5. Handshake Done
+            done_pkt = handshake_completed_packet()
+            await self._client.write_gatt_char(NUNA_TRANSFER, done_pkt, response=True)
+            
+            # 6. Set Time
+            time_pkt = nuna_set_time_packet(int(time.time() * 1000))
+            await self._client.write_gatt_char(NUNA_WRITE, time_pkt, response=True)
+            
+            # 7. Start Audio
+            off_pkt = nuna_switch_record_packet(True, command_id=session.next_command_id())
+            await self._client.write_gatt_char(NUNA_WRITE, off_pkt, response=True)
+            
+            session.reconnecting = False
+            session.ble_disconnected_at = None
+            evt("reconnect_success")
+            
+        except Exception as exc:
+            evt("reconnect_failed", error=str(exc))
+            session.reconnecting = False
+            # Will be picked up by the idle watcher and retried if still in grace period
+
     async def _nuna_try_mmwave(self) -> dict[str, Any]:
         from nuna_protocol import enable_milewave as _enable_mw
         if self._client is None or not self._client.is_connected:
@@ -1024,9 +1215,10 @@ class BleManager:
         def evt(name: str, **kwargs: Any) -> None:
             self._publish({"type": "nuna_event", "name": name, "ts": time.time(), **kwargs})
 
-        # ensure A001 is subscribed so any SENSOR_DATA frames hit our SSE
+        # ensure A001 and A002 are subscribed so any SENSOR_DATA frames hit our SSE
         await self._subscribe(NUNA_NOTIFY)
-        evt("mmwave_subscribed_a001")
+        await self._subscribe(NUNA_TRANSFER)
+        evt("mmwave_subscribed_a001_and_a002")
 
         bytes_seen_before = 0  # note: this is global notify volume, OK for a probe
         try:
@@ -1059,9 +1251,7 @@ class BleManager:
         return {"state_after": state}
 
     async def _nuna_stop(self, force: bool = False) -> dict[str, Any]:
-        active = next(
-            (s for s in self._nuna_sessions.values() if not s.stopped), None
-        )
+        active = self._active_nuna_session()
         if active is None:
             return {"stopped": True, "active": None}
 

@@ -128,8 +128,30 @@
       <div id="status" class="row">
         <span class="pill bad" id="conn-pill">disconnected</span>
         <span id="conn-info"></span>
+        <span class="pill" id="hr-pill" style="background: #ff4757; display: none;">❤️ HR: --</span>
         <button id="btn-disconnect" class="secondary">Disconnect</button>
       </div>
+    </section>
+
+    <!-- Premium Heart Rate Section (temp hidden) -->
+    <section id="hr-section" class="card" style="display: none; grid-column: 1 / -1; background: linear-gradient(135deg, #1e0930 0%, #402365 100%); border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37); position: relative; overflow: hidden;">
+      <div style="position: absolute; top: -50%; left: -50%; width: 200%; height: 200%; background: radial-gradient(circle, rgba(255,71,87,0.1) 0%, transparent 60%); opacity: 0.5; pointer-events: none; animation: pulse-bg 4s infinite alternate;"></div>
+      <style>
+        @keyframes pulse-bg { 0% { transform: scale(0.9); opacity: 0.3; } 100% { transform: scale(1.1); opacity: 0.6; } }
+        @keyframes heartbeat { 0% { transform: scale(1); } 20% { transform: scale(1.25); } 40% { transform: scale(1); } 60% { transform: scale(1.15); } 80% { transform: scale(1); } 100% { transform: scale(1); } }
+        .hr-anim-active { animation: heartbeat 1.2s infinite; }
+      </style>
+      <h2 style="color: rgba(255,255,255,0.8); position: relative; z-index: 1;">Live Heart Rate Monitor</h2>
+      <div style="display: flex; align-items: center; justify-content: center; padding: 30px 20px; position: relative; z-index: 1;">
+        <div style="display: flex; align-items: center; gap: 24px;">
+          <div id="hr-icon" style="font-size: 56px; filter: drop-shadow(0 0 16px rgba(255,71,87,0.6)); display: flex; align-items: center; justify-content: center;">❤️</div>
+          <div style="display: flex; align-items: baseline; gap: 8px;">
+            <span id="hr-value" style="font-size: 72px; font-weight: 800; color: #fff; text-shadow: 0 4px 24px rgba(255,71,87,0.5); font-family: ui-monospace, 'SF Mono', Menlo, monospace; letter-spacing: -2px;">--</span> 
+            <span style="font-size: 24px; font-weight: 600; color: rgba(255,255,255,0.5);">BPM</span>
+          </div>
+        </div>
+      </div>
+      <div id="hr-status-text" style="text-align: center; color: rgba(255,255,255,0.5); font-size: 13px; text-transform: uppercase; letter-spacing: 1px; position: relative; z-index: 1;">Waiting for BLE connection...</div>
     </section>
 
     <section class="card">
@@ -155,7 +177,8 @@
       <pre id="services-out" style="margin-top:12px">(connect to a device first)</pre>
     </section>
 
-    <section class="card" style="grid-column: 1 / -1;">
+    <!-- Advanced BLE tools (temp hidden) -->
+    <section id="capture-section" class="card" style="display: none; grid-column: 1 / -1;">
       <h2>Capture audio / file</h2>
       <p style="margin:0 0 10px; color:var(--muted)">
         Pick the notify characteristic(s) the device streams data on, optionally fire a "start" command,
@@ -228,7 +251,7 @@
       <pre id="wav-out" style="margin-top:12px">(no wav yet)</pre>
     </section>
 
-    <section class="card">
+    <section id="rw-section" class="card" style="display: none;">
       <h2>Read / Write</h2>
       <div class="row">
         <input id="char-uuid" placeholder="characteristic UUID">
@@ -241,7 +264,7 @@
       <pre id="rw-out" style="margin-top:12px">(no result yet)</pre>
     </section>
 
-    <section class="card">
+    <section id="stream-section" class="card" style="display: none;">
       <h2>Notifications stream</h2>
       <div class="row">
         <button id="btn-subscribe">Subscribe</button>
@@ -253,6 +276,9 @@
   </div>
 
   <script>
+    // Feature flags — set true to show hidden sections
+    const SHOW_HEART_RATE = false;
+    const SHOW_ADVANCED_BLE = false; // Capture audio/file, Read/Write, Notifications stream
     const $ = (id) => document.getElementById(id);
     async function api(path, opts={}) {
       const res = await fetch(path, { headers: {"Content-Type":"application/json"}, ...opts });
@@ -264,7 +290,9 @@
       }
       return body;
     }
+    let is_connected = false;
     function setStatus(s) {
+      is_connected = s.connected;
       const pill = $("conn-pill");
       const info = $("conn-info");
       if (s.connected) {
@@ -689,6 +717,59 @@
         }
       } catch {}
     });
+
+    if (SHOW_HEART_RATE) $("hr-section").style.display = "";
+    if (SHOW_ADVANCED_BLE) {
+      $("capture-section").style.display = "";
+      $("rw-section").style.display = "";
+      $("stream-section").style.display = "";
+    }
+
+    setInterval(async () => {
+      if (!SHOW_HEART_RATE) return;
+
+      const hrDisplay = $("hr-value");
+      const hrIcon = $("hr-icon");
+      const hrStatus = $("hr-status-text");
+      const hrPill = $("hr-pill");
+
+      if (!is_connected) {
+        if (hrPill) hrPill.style.display = 'none';
+        if (hrDisplay) hrDisplay.textContent = "--";
+        if (hrStatus) {
+          hrStatus.textContent = "Waiting for BLE connection...";
+          hrStatus.style.color = "rgba(255,255,255,0.5)";
+        }
+        if (hrIcon) hrIcon.classList.remove("hr-anim-active");
+        return;
+      }
+
+      try {
+        let r = await fetch("/api/nuna/hr");
+        let j = await r.json();
+        if (j.hr) {
+          if (hrPill) {
+            hrPill.style.display = 'inline-block';
+            hrPill.textContent = "❤️ HR: " + j.hr;
+          }
+          if (hrDisplay) hrDisplay.textContent = j.hr;
+          if (hrStatus) {
+            hrStatus.textContent = "Live tracking active";
+            hrStatus.style.color = "#4ade80";
+          }
+          if (hrIcon) hrIcon.classList.add("hr-anim-active");
+        } else {
+          if (hrPill) hrPill.style.display = 'none';
+          if (hrDisplay) hrDisplay.textContent = "--";
+          if (hrStatus) {
+            hrStatus.textContent = "Waiting for heart rate data...";
+            hrStatus.style.color = "rgba(255,255,255,0.5)";
+          }
+          if (hrIcon) hrIcon.classList.remove("hr-anim-active");
+        }
+      } catch (e) {
+      }
+    }, 1500);
   </script>
 </body>
 </html>

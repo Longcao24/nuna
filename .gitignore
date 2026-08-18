@@ -7,3 +7,8 @@ __pycache__/
 # Runtime artifacts (session captures, decompiled APK references, server logs)
 recordings/
 logs/
+
+# APK binaries and signing keys (too large / sensitive for git)
+*.apk
+*.apk.idsig
+*.keystore
