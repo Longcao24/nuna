@@ -32,6 +32,7 @@ from nuna_protocol import (
     MessageType as NunaMsgType,
     NOTIFY_CHARS as NUNA_NOTIFY_CHARS,
     Parser as NunaParser,
+    SERVICE_UUID as NUNA_SERVICE_UUID,
     extract_opus_packets,
     handshake_completed_packet,
     handshake_request_packet,
@@ -46,6 +47,63 @@ NUNA_NOTIFY = NUNA_STATUS
 NUNA_WRITE = NUNA_TRANSFER
 NUNA_AUDIO_IDLE_STOP_S = 3.0
 NUNA_START_NO_AUDIO_STALE_S = 30.0
+
+
+def _good_ble_name(*names: Optional[str]) -> Optional[str]:
+    """Bleak on Windows sets device.name to 'Unknown' before scan response arrives."""
+    for name in names:
+        if not name:
+            continue
+        cleaned = str(name).strip()
+        if cleaned and cleaned.lower() != "unknown":
+            return cleaned
+    return None
+
+
+def _canonical_service_uuid(uuid: str) -> str:
+    u = (uuid or "").lower().strip("{}")
+    if len(u) == 4:
+        return f"0000{u}-0000-1000-8000-00805f9b34fb"
+    if len(u) == 8 and "-" not in u:
+        return f"0000{u[:4]}-0000-1000-8000-00805f9b34fb"
+    return u
+
+
+def _is_nuna_service_uuid(uuid: str) -> bool:
+    return _canonical_service_uuid(uuid) == NUNA_SERVICE_UUID
+
+
+def _adv_is_nuna(
+    device: BLEDevice,
+    adv: AdvertisementData,
+    *,
+    name_substr: str = "nuna",
+) -> bool:
+    name = _good_ble_name(device.name, adv.local_name) or ""
+    if name_substr.lower() in name.lower():
+        return True
+    for uuid in adv.service_uuids or []:
+        if _is_nuna_service_uuid(uuid):
+            return True
+    for uuid in (adv.service_data or {}):
+        if _is_nuna_service_uuid(uuid):
+            return True
+    return False
+
+
+def _scan_entry_is_nuna(entry: dict[str, Any]) -> bool:
+    if entry.get("is_nuna"):
+        return True
+    name = (entry.get("name") or "").lower()
+    if "nuna" in name:
+        return True
+    for uuid in entry.get("service_uuids") or []:
+        if _is_nuna_service_uuid(uuid):
+            return True
+    for uuid in (entry.get("service_data") or {}):
+        if _is_nuna_service_uuid(uuid):
+            return True
+    return False
 
 
 def _norm(uuid: str) -> str:
@@ -957,18 +1015,11 @@ class BleManager:
                 # service UUID (0xA000) as a positive ID. That way the user
                 # doesn't have to wait for the scan response just to start
                 # live audio.
-                nuna_service = "0000a000-0000-1000-8000-00805f9b34fb"
 
                 def cb(d: BLEDevice, adv: AdvertisementData) -> None:
                     if found["d"]:
                         return
-                    n = d.name or adv.local_name or ""
-                    if name_substr.lower() in n.lower():
-                        found["d"] = d
-                        done.set()
-                        return
-                    svc = [(u or "").lower() for u in (adv.service_uuids or [])]
-                    if nuna_service in svc:
+                    if _adv_is_nuna(d, adv, name_substr=name_substr):
                         found["d"] = d
                         done.set()
 
@@ -1321,21 +1372,26 @@ class BleManager:
                     "name": None,
                     "rssi": adv.rssi,
                     "service_uuids": [],
+                    "service_data": {},
                     "manufacturer_data": {},
                 }
                 found[device.address] = entry
 
-            name = device.name or adv.local_name
-            if name and not entry["name"]:
+            name = _good_ble_name(device.name, adv.local_name)
+            if name:
                 entry["name"] = name
             if adv.rssi is not None:
                 entry["rssi"] = adv.rssi
             if adv.service_uuids:
-                seen = set(entry["service_uuids"])
+                seen = {_canonical_service_uuid(u) for u in entry["service_uuids"]}
                 for u in adv.service_uuids:
-                    if u not in seen:
-                        entry["service_uuids"].append(u)
-                        seen.add(u)
+                    canon = _canonical_service_uuid(u)
+                    if canon not in seen:
+                        entry["service_uuids"].append(canon)
+                        seen.add(canon)
+            if adv.service_data:
+                for k, v in adv.service_data.items():
+                    entry["service_data"][_canonical_service_uuid(k)] = v.hex()
             if adv.manufacturer_data:
                 for k, v in adv.manufacturer_data.items():
                     entry["manufacturer_data"][str(k)] = v.hex()
@@ -1350,7 +1406,35 @@ class BleManager:
             await asyncio.sleep(seconds)
         finally:
             await scanner.stop()
-        return list(found.values())
+
+        # WinRT sometimes omits service UUIDs from generic scan callbacks but
+        # still returns the device when the scanner is filtered to that service.
+        filtered_hits: set[str] = set()
+        if seconds >= 3.0:
+            def _on_nuna_filter(device: BLEDevice, adv: AdvertisementData) -> None:
+                filtered_hits.add(device.address)
+                _on_detect(device, adv)
+
+            nuna_scanner = BleakScanner(
+                detection_callback=_on_nuna_filter,
+                scanning_mode="active",
+                service_uuids=[NUNA_SERVICE_UUID],
+            )
+            await nuna_scanner.start()
+            try:
+                await asyncio.sleep(min(4.0, seconds))
+            finally:
+                await nuna_scanner.stop()
+
+        results: list[dict[str, Any]] = []
+        for entry in found.values():
+            if entry["address"] in filtered_hits and not entry["service_uuids"]:
+                entry["service_uuids"] = [NUNA_SERVICE_UUID]
+            entry["is_nuna"] = _scan_entry_is_nuna(entry)
+            if entry["is_nuna"] and not entry.get("name"):
+                entry["name"] = "Nuna"
+            results.append(entry)
+        return results
 
     async def _connect(self, address: str, timeout: float) -> dict[str, Any]:
         if self._client is not None and self._client.is_connected:

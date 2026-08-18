@@ -4,10 +4,11 @@ A small Flask + [bleak](https://github.com/hbldh/bleak) server that scans, conne
 and **streams notifications** from a BLE peripheral over an HTTP API. Includes a tiny browser UI
 at `/` for quick testing.
 
-Works on macOS, Linux, and Windows. On macOS the OS will prompt for Bluetooth permission the first
-time you scan — grant it.
+Works on macOS, Linux, and Windows. Platform-specific setup is below.
 
 ## Quick start
+
+### macOS / Linux
 
 ```bash
 python3 -m venv .venv
@@ -24,6 +25,50 @@ Configure with env vars: `HOST` (default `127.0.0.1`), `PORT` (default `5055`).
 > **macOS gotcha:** port `5000` is squatted by **AirPlay Receiver** which returns HTTP 403 for
 > anything that isn't AirPlay. That's why this server defaults to **5055**. If you'd rather use
 > 5000, disable AirPlay Receiver in *System Settings → General → AirDrop & Handoff*.
+
+### Windows
+
+**Prerequisites**
+
+- Windows 10 or 11 with a built-in or USB **Bluetooth 4.0+** adapter
+- [Python 3.10+](https://www.python.org/downloads/windows/) — check **"Add python.exe to PATH"**
+  during install (or install via `winget install Python.Python.3.12`)
+- Bluetooth turned on in *Settings → Bluetooth & devices*
+
+**Setup**
+
+Open **PowerShell** or **Command Prompt** in the project folder:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+python app.py
+```
+
+Open http://127.0.0.1:5055 in your browser.
+
+Optional env vars (PowerShell):
+
+```powershell
+$env:HOST = "127.0.0.1"
+$env:PORT = "5055"
+python app.py
+```
+
+**Windows BLE notes**
+
+- Device addresses are **MAC addresses** (`AA:BB:CC:DD:EE:FF`), not the CoreBluetooth UUIDs
+  macOS uses in the connect API.
+- Many peripherals (including Nuna pendants) do **not** advertise their friendly name in the
+  first scan packet. The UI merges later scan responses, badges Nuna devices by service UUID
+  `0000a000-…`, and labels them **Nuna** even when no name arrives. Enable **show only Nuna
+  devices** to filter the list, or paste the MAC address from *Settings → Bluetooth* into
+  **connect by address** and click Connect.
+- If scan returns nothing useful, try a **12–15 s** scan with the Nuna phone app fully closed
+  (only one central can connect at a time).
+- Windows may prompt to allow Python through the firewall the first time the server listens on
+  a port — allow it for private networks so the browser can reach http://127.0.0.1:5055.
 
 ## API
 
@@ -129,6 +174,9 @@ audio channel. The smaller files alongside it are probably control/ack frames.
 
 ## Notes
 
+- On **macOS**, the OS prompts for Bluetooth permission the first time you scan — grant it.
+- On **Windows**, bleak uses the WinRT backend; scanning runs in **active** mode so
+  scan-response packets (where device names usually appear) are collected.
 - Notifications run inside the bleak event loop in a background thread; SSE subscribers receive
   every event via thread-safe queues. Multiple browser tabs can stream simultaneously.
 - The Flask reloader is intentionally disabled so we don't spawn two BLE event loops.

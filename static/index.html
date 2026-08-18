@@ -156,9 +156,21 @@
 
     <section class="card">
       <h2>Scan</h2>
+      <p id="scan-hint" style="margin:0 0 10px; color:var(--muted); font-size:12px; display:none">
+        On Windows, BLE names often never appear in scan results. Nuna pendants are identified by
+        service <code>0000a000</code> and shown with a green <strong>Nuna</strong> badge — or connect
+        directly by MAC address below. Try 12–15 s scan with the phone app closed.
+      </p>
       <div class="row">
         <label>seconds <input id="scan-seconds" type="number" value="5" min="1" max="30" style="min-width:80px"></label>
         <button id="btn-scan">Scan</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label style="flex:1; min-width:240px">
+          connect by address (Windows MAC):
+          <input id="connect-address" placeholder="AA:BB:CC:DD:EE:FF" style="margin-left:6px; min-width:200px">
+        </label>
+        <button id="btn-connect-address" class="secondary">Connect</button>
       </div>
       <div class="row" style="margin-top:6px">
         <label><input type="checkbox" id="scan-only-nuna"> show only Nuna devices</label>
@@ -310,19 +322,51 @@
     // identify the pendant by service UUID instead and badge it in the row
     // so the user can find it even when name == null.
     const NUNA_SERVICE_UUID = "0000a000-0000-1000-8000-00805f9b34fb";
+    const IS_WINDOWS = /Windows/i.test(navigator.userAgent || "");
+    if (IS_WINDOWS) {
+      $("scan-seconds").value = "12";
+      $("scan-hint").style.display = "block";
+    }
+    function canonicalServiceUuid(uuid) {
+      const u = (uuid || "").toLowerCase().replace(/[{}]/g, "");
+      if (u.length === 4) return `0000${u}-0000-1000-8000-00805f9b34fb`;
+      if (u.length === 8 && !u.includes("-")) return `0000${u.slice(0, 4)}-0000-1000-8000-00805f9b34fb`;
+      return u;
+    }
     function isNuna(d) {
+      if (d.is_nuna) return true;
       const name = (d.name || "").toLowerCase();
       if (name.includes("nuna")) return true;
-      const uuids = (d.service_uuids || []).map(u => (u || "").toLowerCase());
-      return uuids.includes(NUNA_SERVICE_UUID);
+      const uuids = (d.service_uuids || []).map(canonicalServiceUuid);
+      if (uuids.includes(NUNA_SERVICE_UUID)) return true;
+      const svcData = Object.keys(d.service_data || {}).map(canonicalServiceUuid);
+      return svcData.includes(NUNA_SERVICE_UUID);
     }
     function deviceLabel(d) {
-      if (d.name) return d.name;
-      if (isNuna(d)) return `<span class="pill good" style="margin-right:6px">Nuna</span><span style="color:var(--muted)">(name not advertised)</span>`;
+      if (isNuna(d)) {
+        const name = d.name && d.name.toLowerCase() !== "unknown" ? d.name : null;
+        return `<span class="pill good" style="margin-right:6px">Nuna</span>${name || `<span style="color:var(--muted)">(no name advertised)</span>`}`;
+      }
+      if (d.name && d.name.toLowerCase() !== "unknown") return d.name;
+      const svc = (d.service_uuids || []).map(u => canonicalServiceUuid(u).slice(4, 8)).filter(Boolean);
+      if (svc.length) {
+        return `<span style="color:var(--muted)">(unnamed)</span> <code style="color:var(--muted); font-size:11px">svc ${svc.join(", ")}</code>`;
+      }
       const mfg = Object.entries(d.manufacturer_data || {})[0];
       if (mfg) return `<span style="color:var(--muted)">(unnamed)</span> <code style="color:var(--muted); font-size:11px">mfg ${mfg[0]}:${mfg[1].slice(0, 12)}${mfg[1].length > 12 ? "…" : ""}</code>`;
       return `<span style="color:var(--muted)">(unnamed)</span>`;
     }
+
+    async function connectAddress(address) {
+      if (!address) return alert("enter a BLE address first");
+      try {
+        setStatus(await api("/api/connect", { method: "POST", body: JSON.stringify({ address }) }));
+      } catch (e) { alert("connect failed: " + e.message); }
+    }
+    $("btn-connect-address").onclick = () => connectAddress($("connect-address").value.trim());
+    $("connect-address").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") connectAddress($("connect-address").value.trim());
+    });
 
     $("btn-scan").onclick = async () => {
       const seconds = parseFloat($("scan-seconds").value || "5");
@@ -338,12 +382,15 @@
           return (b.rssi ?? -999) - (a.rssi ?? -999);
         });
         const filtered = $("scan-only-nuna").checked ? devices.filter(isNuna) : devices;
+        const emptyMsg = $("scan-only-nuna").checked
+          ? "no Nuna devices found — uncheck the filter, scan longer (12–15 s), or connect by MAC address"
+          : "no devices found";
         tbody.innerHTML = filtered.map(d => `
           <tr data-address="${d.address}" ${isNuna(d) ? 'style="background:rgba(74,222,128,.05)"' : ""}>
             <td>${deviceLabel(d)}</td>
             <td><code>${d.address}</code></td>
             <td>${d.rssi ?? ""}</td>
-          </tr>`).join("") || `<tr><td colspan="3" style="color:var(--muted)">no devices found</td></tr>`;
+          </tr>`).join("") || `<tr><td colspan="3" style="color:var(--muted)">${emptyMsg}</td></tr>`;
         tbody.querySelectorAll("tr[data-address]").forEach(tr => {
           tr.onclick = async () => {
             try {
