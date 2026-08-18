@@ -157,9 +157,10 @@
     <section class="card">
       <h2>Scan</h2>
       <p id="scan-hint" style="margin:0 0 10px; color:var(--muted); font-size:12px; display:none">
-        On Windows, BLE names often never appear in scan results. Nuna pendants are identified by
-        service <code>0000a000</code> and shown with a green <strong>Nuna</strong> badge — or connect
-        directly by MAC address below. Try 12–15 s scan with the phone app closed.
+        Windows often hides BLE names (macOS shows <code>nuna device_05D0</code>). After scan, look
+        at the <strong>id</strong> column — it is the last 2 bytes of the MAC, so
+        <code>…:05:D0</code> is the same pendant as <code>nuna device_05D0</code>. Strongest RSSI
+        nearby devices are probed for the GAP name automatically. Keep the phone app closed.
       </p>
       <div class="row">
         <label>seconds <input id="scan-seconds" type="number" value="5" min="1" max="30" style="min-width:80px"></label>
@@ -176,7 +177,7 @@
         <label><input type="checkbox" id="scan-only-nuna"> show only Nuna devices</label>
       </div>
       <div style="margin-top:12px">
-        <table id="devices-table"><thead><tr><th>Name</th><th>Address</th><th>RSSI</th></tr></thead><tbody></tbody></table>
+        <table id="devices-table"><thead><tr><th>Name</th><th>Address</th><th>Id</th><th>RSSI</th></tr></thead><tbody></tbody></table>
       </div>
     </section>
 
@@ -371,7 +372,7 @@
     $("btn-scan").onclick = async () => {
       const seconds = parseFloat($("scan-seconds").value || "5");
       const tbody = $("devices-table").querySelector("tbody");
-      tbody.innerHTML = `<tr><td colspan="3" style="color:var(--muted)">scanning ${seconds}s…</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="4" style="color:var(--muted)">scanning ${seconds}s…</td></tr>`;
       try {
         const { devices } = await api(`/api/scan?seconds=${seconds}`);
         devices.sort((a, b) => {
@@ -389,8 +390,9 @@
           <tr data-address="${d.address}" ${isNuna(d) ? 'style="background:rgba(74,222,128,.05)"' : ""}>
             <td>${deviceLabel(d)}</td>
             <td><code>${d.address}</code></td>
+            <td><code>${d.address_suffix || ""}</code></td>
             <td>${d.rssi ?? ""}</td>
-          </tr>`).join("") || `<tr><td colspan="3" style="color:var(--muted)">${emptyMsg}</td></tr>`;
+          </tr>`).join("") || `<tr><td colspan="4" style="color:var(--muted)">${emptyMsg}</td></tr>`;
         tbody.querySelectorAll("tr[data-address]").forEach(tr => {
           tr.onclick = async () => {
             try {
@@ -398,7 +400,7 @@
             } catch (e) { alert("connect failed: " + e.message); }
           };
         });
-      } catch (e) { tbody.innerHTML = `<tr><td colspan="3" style="color:var(--bad)">${e.message}</td></tr>`; }
+      } catch (e) { tbody.innerHTML = `<tr><td colspan="4" style="color:var(--bad)">${e.message}</td></tr>`; }
     };
 
     $("btn-disconnect").onclick = async () => { try { setStatus(await api("/api/disconnect", { method: "POST" })); } catch (e) { alert(e.message); } };

@@ -60,11 +60,13 @@ python app.py
 
 - Device addresses are **MAC addresses** (`AA:BB:CC:DD:EE:FF`), not the CoreBluetooth UUIDs
   macOS uses in the connect API.
-- Many peripherals (including Nuna pendants) do **not** advertise their friendly name in the
-  first scan packet. The UI merges later scan responses, badges Nuna devices by service UUID
-  `0000a000-…`, and labels them **Nuna** even when no name arrives. Enable **show only Nuna
-  devices** to filter the list, or paste the MAC address from *Settings → Bluetooth* into
-  **connect by address** and click Connect.
+- macOS shows names like `nuna device_05D0`. Windows often lists the same pendant as
+  **(unnamed)** because the name lives in a BLE scan-response that WinRT does not always
+  deliver. The **Id** column is the last 2 bytes of the MAC — `05D0` is the same device as
+  `nuna device_05D0`. Scan also probes nearby unnamed devices for the GAP Device Name
+  (the name macOS shows).
+- Enable **show only Nuna devices** after names resolve, or paste the MAC into
+  **connect by address**.
 - If scan returns nothing useful, try a **12–15 s** scan with the Nuna phone app fully closed
   (only one central can connect at a time).
 - Windows may prompt to allow Python through the firewall the first time the server listens on

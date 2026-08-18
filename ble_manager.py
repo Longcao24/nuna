@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import struct
+import sys
 import threading
 import time
 import uuid as uuidlib
@@ -49,15 +50,101 @@ NUNA_AUDIO_IDLE_STOP_S = 3.0
 NUNA_START_NO_AUDIO_STALE_S = 30.0
 
 
+GAP_DEVICE_NAME_UUID = "00002a00-0000-1000-8000-00805f9b34fb"
+# AD types we parse ourselves on Windows — WinRT often leaves LocalName empty
+# even when the complete/shortened name is in a scan-response section.
+_AD_INCOMPLETE_UUIDS_16 = 0x02
+_AD_COMPLETE_UUIDS_16 = 0x03
+_AD_SHORT_NAME = 0x08
+_AD_COMPLETE_NAME = 0x09
+
+
 def _good_ble_name(*names: Optional[str]) -> Optional[str]:
     """Bleak on Windows sets device.name to 'Unknown' before scan response arrives."""
     for name in names:
         if not name:
             continue
-        cleaned = str(name).strip()
+        cleaned = str(name).strip().strip("\x00")
         if cleaned and cleaned.lower() != "unknown":
             return cleaned
     return None
+
+
+def _mac_suffix(address: str) -> Optional[str]:
+    """Last 2 bytes of a Windows MAC, e.g. AA:BB:CC:DD:05:D0 → 05D0.
+
+    Matches the suffix in advertised names like ``nuna device_05D0``.
+    """
+    parts = (address or "").replace("-", ":").split(":")
+    if len(parts) == 6 and all(len(p) == 2 for p in parts):
+        try:
+            int("".join(parts), 16)
+        except ValueError:
+            return None
+        return (parts[4] + parts[5]).upper()
+    return None
+
+
+def _decode_ad_text(data: bytes) -> Optional[str]:
+    for encoding in ("utf-8", "utf-16-le", "latin-1"):
+        try:
+            text = data.decode(encoding).strip("\x00").strip()
+        except Exception:
+            continue
+        if text and text.isprintable():
+            return text
+    return None
+
+
+def _winrt_advertisement_objects(device: BLEDevice, adv: AdvertisementData) -> list[Any]:
+    objs: list[Any] = []
+    raw = None
+    platform_data = getattr(adv, "platform_data", None)
+    if isinstance(platform_data, tuple) and len(platform_data) >= 2:
+        raw = platform_data[1]
+    if raw is None:
+        raw = getattr(device, "details", None)
+    if raw is None:
+        return objs
+    for attr in ("adv", "scan"):
+        event = getattr(raw, attr, None)
+        advertisement = getattr(event, "advertisement", None) if event is not None else None
+        if advertisement is not None:
+            objs.append(advertisement)
+    return objs
+
+
+def _parse_winrt_sections(device: BLEDevice, adv: AdvertisementData) -> tuple[Optional[str], list[str]]:
+    """Pull local name + 16-bit service UUIDs from WinRT AD sections.
+
+    Bleak's WinRT backend only copies Advertisement.LocalName, which is often
+    empty on Windows even when Complete Local Name is in the scan response.
+    """
+    names: list[str] = []
+    uuids: list[str] = []
+    for advertisement in _winrt_advertisement_objects(device, adv):
+        local = getattr(advertisement, "local_name", None)
+        if local:
+            names.append(str(local))
+        for u in getattr(advertisement, "service_uuids", None) or []:
+            uuids.append(str(u))
+        get_sections = getattr(advertisement, "get_sections_by_type", None)
+        if not callable(get_sections):
+            continue
+        try:
+            for ad_type in (_AD_COMPLETE_NAME, _AD_SHORT_NAME):
+                for section in get_sections(ad_type):
+                    decoded = _decode_ad_text(bytes(section.data))
+                    if decoded:
+                        names.append(decoded)
+            for ad_type in (_AD_INCOMPLETE_UUIDS_16, _AD_COMPLETE_UUIDS_16):
+                for section in get_sections(ad_type):
+                    data = bytes(section.data)
+                    for i in range(0, len(data) - 1, 2):
+                        uuids.append(f"{data[i + 1]:02x}{data[i]:02x}")
+        except Exception:
+            continue
+    return _good_ble_name(*names), uuids
 
 
 def _canonical_service_uuid(uuid: str) -> str:
@@ -79,10 +166,11 @@ def _adv_is_nuna(
     *,
     name_substr: str = "nuna",
 ) -> bool:
-    name = _good_ble_name(device.name, adv.local_name) or ""
+    section_name, section_uuids = _parse_winrt_sections(device, adv)
+    name = _good_ble_name(device.name, adv.local_name, section_name) or ""
     if name_substr.lower() in name.lower():
         return True
-    for uuid in adv.service_uuids or []:
+    for uuid in list(adv.service_uuids or []) + section_uuids:
         if _is_nuna_service_uuid(uuid):
             return True
     for uuid in (adv.service_data or {}):
@@ -104,6 +192,90 @@ def _scan_entry_is_nuna(entry: dict[str, Any]) -> bool:
         if _is_nuna_service_uuid(uuid):
             return True
     return False
+
+
+def _finalize_scan_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    suffix = _mac_suffix(entry.get("address") or "")
+    if suffix:
+        entry["address_suffix"] = suffix
+    entry["is_nuna"] = _scan_entry_is_nuna(entry)
+    if entry["is_nuna"] and not entry.get("name"):
+        entry["name"] = f"nuna device_{suffix}" if suffix else "Nuna"
+    return entry
+
+
+async def _windows_cached_name(address: str) -> Optional[str]:
+    try:
+        from winrt.windows.devices.bluetooth import BluetoothLEDevice
+    except Exception:
+        return None
+    try:
+        addr_int = int(address.replace(":", ""), 16)
+        device = await BluetoothLEDevice.from_bluetooth_address_async(addr_int)
+        if device is None:
+            return None
+        try:
+            return _good_ble_name(getattr(device, "name", None))
+        finally:
+            closer = getattr(device, "close", None)
+            if callable(closer):
+                closer()
+    except Exception:
+        return None
+
+
+async def _probe_gap_device_name(address: str, ble_device: Optional[BLEDevice] = None) -> Optional[str]:
+    """Connect briefly and read GAP Device Name — this is what macOS shows."""
+    target: Any = ble_device or address
+    client = BleakClient(target, timeout=4.0)
+    try:
+        await asyncio.wait_for(client.connect(), 5.0)
+        data = await asyncio.wait_for(
+            client.read_gatt_char(GAP_DEVICE_NAME_UUID), 2.0
+        )
+        return _good_ble_name(bytes(data).decode("utf-8", "replace"))
+    except Exception:
+        return None
+    finally:
+        try:
+            if client.is_connected:
+                await client.disconnect()
+        except Exception:
+            pass
+
+
+async def _resolve_windows_names(
+    entries: list[dict[str, Any]],
+    ble_devices: Optional[dict[str, BLEDevice]] = None,
+) -> None:
+    if sys.platform != "win32":
+        return
+    unnamed = [e for e in entries if not e.get("name")]
+    if not unnamed:
+        return
+    unnamed.sort(key=lambda e: e.get("rssi") if e.get("rssi") is not None else -999, reverse=True)
+
+    async def _fill_cached(entry: dict[str, Any]) -> None:
+        name = await _windows_cached_name(entry["address"])
+        if name:
+            entry["name"] = name
+
+    await asyncio.gather(*(_fill_cached(e) for e in unnamed[:20]), return_exceptions=True)
+
+    still = [
+        e for e in unnamed
+        if not e.get("name") and (e.get("rssi") is not None and e["rssi"] >= -80)
+    ]
+    still = still[:4]
+    devices = ble_devices or {}
+
+    async def _fill_gap(entry: dict[str, Any]) -> None:
+        name = await _probe_gap_device_name(entry["address"], devices.get(entry["address"]))
+        if name:
+            entry["name"] = name
+
+    if still:
+        await asyncio.gather(*(_fill_gap(e) for e in still), return_exceptions=True)
 
 
 def _norm(uuid: str) -> str:
@@ -528,7 +700,8 @@ class BleManager:
     # ---------- public sync API used by Flask ----------
 
     def scan(self, seconds: float = 5.0) -> list[dict[str, Any]]:
-        return self._submit(self._scan(seconds), timeout=seconds + 10)
+        extra = 35 if sys.platform == "win32" else 10
+        return self._submit(self._scan(seconds), timeout=seconds + extra)
 
     def connect(self, address: str, timeout: float = 15.0) -> dict[str, Any]:
         return self._submit(self._connect(address, timeout), timeout=timeout + 10)
@@ -1363,8 +1536,10 @@ class BleManager:
         # loses the name. Always keep the best-so-far name and union the
         # service UUID / manufacturer data sets.
         found: dict[str, dict[str, Any]] = {}
+        ble_devices: dict[str, BLEDevice] = {}
 
         def _on_detect(device: BLEDevice, adv: AdvertisementData) -> None:
+            ble_devices[device.address] = device
             entry = found.get(device.address)
             if entry is None:
                 entry = {
@@ -1377,18 +1552,18 @@ class BleManager:
                 }
                 found[device.address] = entry
 
-            name = _good_ble_name(device.name, adv.local_name)
+            section_name, section_uuids = _parse_winrt_sections(device, adv)
+            name = _good_ble_name(device.name, adv.local_name, section_name)
             if name:
                 entry["name"] = name
             if adv.rssi is not None:
                 entry["rssi"] = adv.rssi
-            if adv.service_uuids:
-                seen = {_canonical_service_uuid(u) for u in entry["service_uuids"]}
-                for u in adv.service_uuids:
-                    canon = _canonical_service_uuid(u)
-                    if canon not in seen:
-                        entry["service_uuids"].append(canon)
-                        seen.add(canon)
+            seen = {_canonical_service_uuid(u) for u in entry["service_uuids"]}
+            for u in list(adv.service_uuids or []) + section_uuids:
+                canon = _canonical_service_uuid(u)
+                if canon not in seen:
+                    entry["service_uuids"].append(canon)
+                    seen.add(canon)
             if adv.service_data:
                 for k, v in adv.service_data.items():
                     entry["service_data"][_canonical_service_uuid(k)] = v.hex()
@@ -1430,10 +1605,11 @@ class BleManager:
         for entry in found.values():
             if entry["address"] in filtered_hits and not entry["service_uuids"]:
                 entry["service_uuids"] = [NUNA_SERVICE_UUID]
-            entry["is_nuna"] = _scan_entry_is_nuna(entry)
-            if entry["is_nuna"] and not entry.get("name"):
-                entry["name"] = "Nuna"
             results.append(entry)
+
+        await _resolve_windows_names(results, ble_devices)
+        for entry in results:
+            _finalize_scan_entry(entry)
         return results
 
     async def _connect(self, address: str, timeout: float) -> dict[str, Any]:
