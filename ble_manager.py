@@ -41,13 +41,14 @@ from nuna_protocol import (
     parse_audio_frame,
     set_time_packet as nuna_set_time_packet,
     switch_record_packet as nuna_switch_record_packet,
+    enable_audio as nuna_legacy_audio_switch,
 )
 
 # Backward-compat aliases (existing methods reference these names)
 NUNA_NOTIFY = NUNA_STATUS
 NUNA_WRITE = NUNA_TRANSFER
 NUNA_AUDIO_IDLE_STOP_S = 3.0
-NUNA_START_NO_AUDIO_STALE_S = 30.0
+NUNA_START_NO_AUDIO_STALE_S = 45.0
 
 
 GAP_DEVICE_NAME_UUID = "00002a00-0000-1000-8000-00805f9b34fb"
@@ -424,6 +425,8 @@ class _NunaSession:
         self.set_time_sent = False
         self.status_read_value: Optional[str] = None
         self.switch_record_sent = False
+        self.working_state: Optional[int] = None
+        self.audio_recording_switch: Optional[int] = None
 
         # CONTROL_REQUEST command-id counter (the app's
         # `CommandManager.createCommandSession()`).
@@ -480,6 +483,22 @@ class _NunaSession:
             publish({
                 "type": "nuna_event", "name": name, "uuid": char_uuid,
                 "hex": body.hex(), "ts": time.time(),
+            })
+        elif mtype == NunaMsgType.WORKING_STATE:
+            if body:
+                self.working_state = body[0]
+            publish({
+                "type": "nuna_event", "name": name, "uuid": char_uuid,
+                "hex": body.hex(), "len": len(body),
+                "working_state": self.working_state, "ts": time.time(),
+            })
+        elif mtype == NunaMsgType.AUDIO_RECORDING_SWITCH:
+            if body:
+                self.audio_recording_switch = body[0]
+            publish({
+                "type": "nuna_event", "name": name, "uuid": char_uuid,
+                "hex": body.hex(), "len": len(body),
+                "enabled": bool(self.audio_recording_switch), "ts": time.time(),
             })
         elif mtype == NunaMsgType.SENSOR_DATA:
             if len(body) >= 9:
@@ -659,6 +678,8 @@ class _NunaSession:
             "set_time_sent": self.set_time_sent,
             "status_read_value": self.status_read_value,
             "switch_record_sent": self.switch_record_sent,
+            "working_state": self.working_state,
+            "audio_recording_switch": self.audio_recording_switch,
         }
 
 
@@ -907,6 +928,13 @@ class BleManager:
                 return f"audio_idle_{idle_s:.1f}s"
         if include_no_audio and session.switch_record_sent and session.audio_packets == 0:
             idle_s = now - session.started_at
+            # 07C2 fw 1666 echoes AUDIO_RECORDING_SWITCH=0 while WORKING_STATE=3
+            # (idle / in case). Killing the session here is what made Start
+            # look like a hard failure — wait for a wear/button transition.
+            if session.audio_recording_switch == 0 or session.working_state == 3:
+                if idle_s >= 90.0:
+                    return f"no_audio_after_{idle_s:.1f}s"
+                return None
             if idle_s >= NUNA_START_NO_AUDIO_STALE_S:
                 return f"no_audio_after_{idle_s:.1f}s"
         return None
@@ -1068,9 +1096,11 @@ class BleManager:
                     except Exception:
                         pass
             for session in list(self._nuna_sessions.values()):
-                if session.stopped or session.last_audio_at is None:
+                if session.stopped:
                     continue
-                reason = self._nuna_stale_reason(session, now=now)
+                reason = self._nuna_stale_reason(
+                    session, now=now, include_no_audio=True
+                )
                 if not reason:
                     continue
 
@@ -1144,8 +1174,11 @@ class BleManager:
 
         active = self._active_nuna_session()
         if active is not None:
-            if force_reconnect:
-                evt("force_stop_existing_session", session=active.id)
+            # A 0-frame session is not "active audio" — restart instead of
+            # returning reuse_active_session when the user hits Start again.
+            no_audio_yet = active.switch_record_sent and active.audio_packets == 0
+            if force_reconnect or no_audio_yet:
+                evt("force_stop_existing_session", session=active.id, no_audio_yet=no_audio_yet)
                 await self._nuna_stop(force=True)
             else:
                 stale_reason = self._nuna_stale_reason(active, include_no_audio=True)
@@ -1164,10 +1197,13 @@ class BleManager:
 
         evt("build_v5_switch_record")
 
-        if force_reconnect and self._client is not None and self._client.is_connected:
-            evt("force_disconnect")
+        # Always take a fresh GATT session. Reusing a scan-time connection
+        # is how we get HS✓ with AUDIO_RECORDING_SWITCH still 0.
+        if self._client is not None:
+            evt("fresh_connect", previous=self._connected_address)
             try:
-                await self._client.disconnect()
+                if self._client.is_connected:
+                    await self._client.disconnect()
             except Exception:
                 pass
             self._client = None
@@ -1226,7 +1262,10 @@ class BleManager:
             with self._lock:
                 self._notify_callbacks.clear()
         else:
-            evt("reusing_existing_client", address=self._connected_address)
+            evt("reusing_existing_client",
+                address=self._connected_address,
+                mtu=getattr(self._client, "mtu_size", None),
+                subscribed=sorted(self._subscribed))
 
         ts = time.strftime("%Y%m%d-%H%M%S")
         session_id = f"nuna-{ts}-{uuidlib.uuid4().hex[:6]}"
@@ -1329,10 +1368,16 @@ class BleManager:
             except Exception as exc:
                 evt("status_read_err", error=str(exc))
 
-        # 5) NOW enable live audio streaming the way the app does:
-        # CONTROL_REQUEST + ControlCommand.SWITCH_RECORD = 3, payload [0x01].
-        # (Writing top-level AUDIO_RECORDING_SWITCH = 17 is silently ignored;
-        # that opcode is the device->app state echo, not a setter.)
+        # 5) Re-arm A003 after handshake. Some firmware only honors the
+        # recording CCCD once the session is authenticated; a subscribe from
+        # before HANDSHAKE_COMPLETED then never delivers AUDIO_RECORDING_DATA.
+        try:
+            await self._resubscribe(NUNA_RECORDING)
+            evt("resubscribed_a003_after_handshake")
+        except Exception as exc:
+            evt("resubscribed_a003_err", error=str(exc))
+
+        # 6) Enable live audio: CONTROL_REQUEST + SWITCH_RECORD=3, payload [0x01].
         await asyncio.sleep(0.15)
         cmd_id = nsession.next_command_id()
         switch_pkt = nuna_switch_record_packet(True, command_id=cmd_id)
@@ -1345,7 +1390,68 @@ class BleManager:
         except Exception as exc:
             evt("switch_record_err", error=str(exc))
 
-        # heartbeat task (matches the official app cadence)
+        try:
+            await self._client.write_gatt_char(
+                NUNA_TRANSFER, nuna_heartbeat(), response=False
+            )
+            evt("heartbeat_sent")
+        except Exception as exc:
+            evt("heartbeat_err", error=str(exc))
+
+        async def _send_switch_record(reason: str) -> None:
+            if self._client is None or not self._client.is_connected or nsession.stopped:
+                return
+            cmd_id = nsession.next_command_id()
+            switch_pkt = nuna_switch_record_packet(True, command_id=cmd_id)
+            await self._client.write_gatt_char(
+                NUNA_TRANSFER, switch_pkt, response=True
+            )
+            nsession.switch_record_sent = True
+            evt("switch_record_on_sent", hex=switch_pkt.hex(), cmd_id=cmd_id, reason=reason)
+            # 07C2 (fw 2.14.5.1666) sometimes ignores CONTROL SWITCH_RECORD
+            # while idle; also poke the legacy type-17 opcode.
+            try:
+                await self._client.write_gatt_char(
+                    NUNA_TRANSFER, nuna_legacy_audio_switch(True), response=True
+                )
+                evt("legacy_audio_switch_sent")
+            except Exception as exc:
+                evt("legacy_audio_switch_err", error=str(exc))
+
+        # Keep retrying SWITCH_RECORD even in WORKING_STATE 03 — 05D0 (fw 1669)
+        # will stream from that state. 07C2 (fw 1666) stays silent until the
+        # pendant is worn / record button is pressed and state becomes 00.
+        async def _arm_audio() -> None:
+            last_try = 0.0
+            last_state: Optional[int] = None
+            while not nsession.stopped:
+                if nsession.audio_packets > 0 or nsession.audio_recording_switch == 1:
+                    return
+                if self._client is None or not self._client.is_connected:
+                    return
+                state = nsession.working_state
+                if state != last_state:
+                    evt(
+                        "working_state",
+                        state=state,
+                        hint=(
+                            "idle — wear 07C2 or press the record button (or use 05D0)"
+                            if state == 3
+                            else "ready" if state == 0 else None
+                        ),
+                    )
+                    last_state = state
+                now = time.time()
+                if now - last_try >= 3.0:
+                    try:
+                        await self._resubscribe(NUNA_RECORDING)
+                        await _send_switch_record("arm_retry")
+                        last_try = now
+                    except Exception as exc:
+                        evt("arm_audio_err", error=str(exc))
+                        last_try = now
+                await asyncio.sleep(0.4)
+
         async def _heartbeat() -> None:
             while True:
                 await asyncio.sleep(5.0)
@@ -1360,6 +1466,7 @@ class BleManager:
                 except Exception:
                     break
 
+        nsession._arm_task = asyncio.create_task(_arm_audio())  # type: ignore[attr-defined]
         nsession._hb_task = asyncio.create_task(_heartbeat())  # type: ignore[attr-defined]
         return nsession.status()
 
@@ -1497,15 +1604,16 @@ class BleManager:
         # cancel heartbeat. Note: awaiting a cancelled task re-raises
         # CancelledError, which is BaseException in 3.8+, so a plain
         # `except Exception` will NOT catch it.
-        hb = getattr(active, "_hb_task", None)
-        if hb is not None:
-            hb.cancel()
-            try:
-                await asyncio.wait_for(hb, timeout=1.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
-            except Exception as exc:
-                errors.append(f"hb_cancel: {exc!r}")
+        for task_attr in ("_hb_task", "_arm_task"):
+            task = getattr(active, task_attr, None)
+            if task is not None:
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=1.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                except Exception as exc:
+                    errors.append(f"{task_attr}_cancel: {exc!r}")
 
         cb = getattr(active, "_notify_cb", None)
         if cb is not None:
@@ -1738,6 +1846,17 @@ class BleManager:
         client = self._require_client()
         await client.write_gatt_char(char_uuid, data, response=response)
         return {"uuid": char_uuid, "wrote": len(data), "response": response}
+
+    async def _resubscribe(self, char_uuid: str) -> dict[str, Any]:
+        client = self._require_client()
+        u = _norm(char_uuid)
+        if u in self._subscribed:
+            try:
+                await client.stop_notify(char_uuid)
+            except Exception:
+                pass
+            self._subscribed.discard(u)
+        return await self._subscribe(char_uuid)
 
     async def _subscribe(self, char_uuid: str) -> dict[str, Any]:
         client = self._require_client()

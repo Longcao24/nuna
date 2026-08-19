@@ -82,7 +82,7 @@
       </div>
       <div class="row" style="margin-top:8px">
         <label><input type="checkbox" id="nuna-pair"> force pair / bond</label>
-        <label><input type="checkbox" id="nuna-force"> force reconnect</label>
+        <label><input type="checkbox" id="nuna-force" checked> force reconnect</label>
         <label>
           verification (6 chars):
           <input id="nuna-vc" value="123456" maxlength="6" style="margin-left:6px; width:90px">
@@ -346,7 +346,7 @@
     function deviceLabel(d) {
       if (isNuna(d)) {
         const name = d.name && d.name.toLowerCase() !== "unknown" ? d.name : null;
-        return `<span class="pill good" style="margin-right:6px">Nuna</span>${name || `<span style="color:var(--muted)">(no name advertised)</span>`}`;
+        return `<span class="pill good" style="margin-right:6px">Nuna</span> ${name || `<span style="color:var(--muted)">(no name advertised)</span>`}`;
       }
       if (d.name && d.name.toLowerCase() !== "unknown") return d.name;
       const svc = (d.service_uuids || []).map(u => canonicalServiceUuid(u).slice(4, 8)).filter(Boolean);
@@ -652,8 +652,20 @@
       nunaActiveId = a.id;
       const dur = (a.last_audio_at && a.first_audio_at) ? (a.last_audio_at - a.first_audio_at) : 0;
       const hsTag = a.handshake_completed_sent ? "HS✓" : (a.handshake_response_match === false ? "HS✗" : "HS…");
-      $("nuna-rate").textContent =
-        `${hsTag} · ${fmtBytes(a.audio_bytes||0)} · ${a.audio_packets||0} frames (${a.audio_chunks||0} chunks) · ${(a.avg_byte_rate||0).toFixed(0)} B/s · span ${dur.toFixed(2)}s`;
+      if (a.switch_record_sent && !(a.audio_packets > 0)) {
+        // AUDIO_RECORDING_SWITCH is the real gate: past captures streamed fine
+        // in WORKING_STATE=03, but never with the switch still reporting 0.
+        if (a.audio_recording_switch === 0) {
+          $("nuna-rate").textContent =
+            `${hsTag} · pendant reports recording OFF — take it off the charger and press the record button; retrying SWITCH_RECORD every 3s`;
+        } else {
+          $("nuna-rate").textContent =
+            `${hsTag} · waiting for live audio on A003 (handshake ok, 0 frames so far)`;
+        }
+      } else {
+        $("nuna-rate").textContent =
+          `${hsTag} · ${fmtBytes(a.audio_bytes||0)} · ${a.audio_packets||0} frames (${a.audio_chunks||0} chunks) · ${(a.avg_byte_rate||0).toFixed(0)} B/s · span ${dur.toFixed(2)}s`;
+      }
       $("nuna-status").textContent = JSON.stringify(a, null, 2);
       const links = [
         `<div class="row" style="margin-top:6px"><code>${a.id}</code> · ${a.dir}</div>`,
@@ -678,6 +690,10 @@
         force_reconnect: $("nuna-force").checked,
         verification_code: ($("nuna-vc").value || "123456").slice(0, 6),
       };
+      try {
+        const st = await api("/api/status");
+        if (st && st.connected && st.address) body.address = st.address;
+      } catch {}
       const duuid = $("nuna-duuid").value.trim();
       if (duuid) body.device_uuid = duuid;
       try {
